@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+_RUNTIME_CACHE: dict[str, dict] = {}
 
 
 @dataclass
@@ -14,10 +19,61 @@ class SolverResult:
     givens: list[list[int]]
     solution: list[list[int]]
     solve_latency_ms: float
+    latency_breakdown_ms: dict[str, float] = field(default_factory=dict)
 
 
+# --------------------------
+# Simple Sudoku solver
+# --------------------------
+def find_empty(grid: np.ndarray):
+    for r in range(9):
+        for c in range(9):
+            if grid[r, c] == 0:
+                return r, c
+    return None
+
+
+def is_valid(grid: np.ndarray, row: int, col: int, val: int) -> bool:
+    if val in grid[row, :]:
+        return False
+
+    if val in grid[:, col]:
+        return False
+
+    br = (row // 3) * 3
+    bc = (col // 3) * 3
+
+    if val in grid[br : br + 3, bc : bc + 3]:
+        return False
+
+    return True
+
+
+def solve_sudoku(grid: np.ndarray) -> bool:
+    empty = find_empty(grid)
+
+    if empty is None:
+        return True
+
+    r, c = empty
+
+    for val in range(1, 10):
+        if is_valid(grid, r, c, val):
+            grid[r, c] = val
+
+            if solve_sudoku(grid):
+                return True
+
+            grid[r, c] = 0
+
+    return False
+
+
+# --------------------------
+# Mock solver
+# --------------------------
 def mock_solver_result(frame_bgr: np.ndarray) -> SolverResult:
-    """Temporary mock result for building the AR layer before wiring the real solver."""
+    """Temporary mock result for building the AR layer before wiring live tracking."""
     start = time.perf_counter()
 
     h, w = frame_bgr.shape[:2]
@@ -72,19 +128,144 @@ def mock_solver_result(frame_bgr: np.ndarray) -> SolverResult:
         givens=givens,
         solution=solution,
         solve_latency_ms=latency_ms,
+        latency_breakdown_ms={"mock": latency_ms},
     )
 
 
-def solve_frame(frame_bgr: np.ndarray, use_mock: bool = True) -> SolverResult:
-    """Temporary adapter.
+# --------------------------
+# Real solver bridge
+# --------------------------
+def load_solver_runtime(repo_root: str | Path) -> dict:
+    repo_root = Path(repo_root).expanduser().resolve()
+    cache_key = str(repo_root)
 
-    Later this function should call the frozen inference path from sudoku-image-solver.
-    For now it returns a deterministic mock result so the AR layer can be built first.
-    """
-    if use_mock:
+    if cache_key in _RUNTIME_CACHE:
+        return _RUNTIME_CACHE[cache_key]
+
+    if not repo_root.exists():
+        raise FileNotFoundError(f"Could not find sudoku-image-solver repo: {repo_root}")
+
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from src.sudoku_solver.inference import load_runtime
+
+    runtime = load_runtime()
+    _RUNTIME_CACHE[cache_key] = runtime
+    return runtime
+
+
+def real_solver_result(frame_bgr: np.ndarray, repo_root: str | Path) -> SolverResult:
+    if frame_bgr is None:
+        raise ValueError("frame_bgr cannot be None")
+
+    repo_root = Path(repo_root).expanduser().resolve()
+
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from src.sudoku_solver.inference import (
+        DEVICE,
+        apply_digit_calibration,
+        apply_occ_calibration,
+        corners_from_segmentation_prob,
+        extract_equal_cells,
+        greedy_grid_from_calibrated,
+        infer_board_outputs_from_crops,
+        predict_mask_prob_letterbox,
+        unletterbox_points,
+        warp_from_corners,
+    )
+
+    runtime = load_solver_runtime(repo_root)
+
+    frozen = runtime["frozen"]
+    warp_size = int(frozen["warp_size"])
+    trim_frac = float(frozen["trim_frac"])
+    occ_threshold = float(frozen["occ_threshold"])
+
+    t_pipeline0 = time.perf_counter()
+
+    # Segmentation -> board corners
+    t0 = time.perf_counter()
+    prob, lb_meta, _ = predict_mask_prob_letterbox(
+        runtime["seg_model"],
+        frame_bgr,
+        runtime["seg_image_size"],
+        DEVICE,
+    )
+    pred_pts_lb, _, _ = corners_from_segmentation_prob(prob, post_thr=0.5)
+    pred_pts_orig = unletterbox_points(pred_pts_lb, lb_meta).astype(np.float32)
+    segmentation_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Warp -> crops
+    t0 = time.perf_counter()
+    warp_bgr = warp_from_corners(frame_bgr, pred_pts_orig, warp_size=warp_size)
+    crops, _ = extract_equal_cells(warp_bgr, trim_frac=trim_frac)
+    warp_crop_ms = (time.perf_counter() - t0) * 1000.0
+
+    # OCR inference
+    t0 = time.perf_counter()
+    outputs = infer_board_outputs_from_crops(crops, runtime)
+
+    occ_probs = apply_occ_calibration(
+        np.asarray(outputs["occ_logits"], dtype=np.float32),
+        runtime["occ_cal"],
+    )
+    digit_probs = apply_digit_calibration(
+        np.asarray(outputs["digit_logits"], dtype=np.float32),
+        runtime["digit_cal"],
+    )
+
+    pred_grid = greedy_grid_from_calibrated(
+        occ_probs,
+        digit_probs,
+        occ_threshold=occ_threshold,
+    )
+    ocr_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Solve puzzle
+    t0 = time.perf_counter()
+    givens_grid = pred_grid.copy()
+    solved_grid = pred_grid.copy()
+
+    if not solve_sudoku(solved_grid):
+        raise RuntimeError(
+            "Solver could not find a valid solution from predicted givens. "
+            "This usually means OCR introduced a wrong given."
+        )
+
+    solve_ms = (time.perf_counter() - t0) * 1000.0
+    pipeline_ms = (time.perf_counter() - t_pipeline0) * 1000.0
+
+    return SolverResult(
+        status="real_solved",
+        corners=pred_pts_orig.astype(np.float32),
+        givens=givens_grid.astype(int).tolist(),
+        solution=solved_grid.astype(int).tolist(),
+        solve_latency_ms=pipeline_ms,
+        latency_breakdown_ms={
+            "segmentation_ms": segmentation_ms,
+            "warp_crop_ms": warp_crop_ms,
+            "ocr_ms": ocr_ms,
+            "sudoku_solve_ms": solve_ms,
+            "pipeline_ms": pipeline_ms,
+        },
+    )
+
+
+def solve_frame(
+    frame_bgr: np.ndarray,
+    solver: str = "mock",
+    repo_root: str | Path = "~/projects/sudoku-image-solver",
+) -> SolverResult:
+    if solver == "mock":
         return mock_solver_result(frame_bgr)
 
-    raise NotImplementedError("Real solver integration is not wired yet. Use mock mode for now.")
+    if solver == "real":
+        return real_solver_result(frame_bgr, repo_root=repo_root)
+
+    raise ValueError(f"Unsupported solver mode: {solver}")
 
 
 def load_image_bgr(path: str) -> np.ndarray:

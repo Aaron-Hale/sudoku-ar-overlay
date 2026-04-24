@@ -13,9 +13,24 @@ from sudoku_ar_overlay.smoothing import smooth_corners
 from sudoku_ar_overlay.solver_adapter import load_image_bgr, solve_frame
 
 
+def print_solver_result(result) -> None:
+    print(f"Solver status: {result.status}")
+    print(f"Solve latency: {result.solve_latency_ms:.2f} ms")
+
+    if result.latency_breakdown_ms:
+        print("Latency breakdown:")
+        for key, value in result.latency_breakdown_ms.items():
+            print(f"  {key}: {value:.2f} ms")
+
+
 def run_image_mode(args: argparse.Namespace) -> None:
     frame = load_image_bgr(args.image)
-    result = solve_frame(frame, use_mock=True)
+
+    result = solve_frame(
+        frame,
+        solver=args.solver,
+        repo_root=args.repo_root,
+    )
 
     out = render_solution_overlay(
         frame=frame,
@@ -30,8 +45,7 @@ def run_image_mode(args: argparse.Namespace) -> None:
     cv2.imwrite(str(out_path), out)
 
     print(f"Wrote overlay image: {out_path}")
-    print(f"Solver status: {result.status}")
-    print(f"Solve latency: {result.solve_latency_ms:.2f} ms")
+    print_solver_result(result)
 
 
 def run_webcam_mode(args: argparse.Namespace) -> None:
@@ -79,7 +93,8 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
         status_text = (
             f"state={session.status.value} "
             f"fps={fps:.1f} "
-            f"solve_ms={session.solve_latency_ms:.1f}"
+            f"solve_ms={session.solve_latency_ms:.1f} "
+            f"solver={args.solver}"
         )
 
         cv2.putText(
@@ -105,7 +120,11 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
             print("Reset session")
 
         if key == ord("s"):
-            result = solve_frame(frame, use_mock=True)
+            result = solve_frame(
+                frame,
+                solver=args.solver,
+                repo_root=args.repo_root,
+            )
             smoothed = smooth_corners(
                 session.smoothed_corners,
                 result.corners,
@@ -118,10 +137,8 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
                 frame_idx=frame_idx,
                 solve_latency_ms=result.solve_latency_ms,
             )
-            print(
-                f"Solved frame {frame_idx}: "
-                f"status={result.status}, latency={result.solve_latency_ms:.2f} ms"
-            )
+            print(f"Solved frame {frame_idx}")
+            print_solver_result(result)
 
         frame_idx += 1
 
@@ -131,11 +148,24 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="sudoku-ar-overlay")
+
     parser.add_argument(
         "--mode",
         choices=["image", "webcam"],
         required=True,
         help="Run a static image overlay or webcam overlay.",
+    )
+    parser.add_argument(
+        "--solver",
+        choices=["mock", "real"],
+        default="mock",
+        help="Use mock solver or real sudoku-image-solver inference path.",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=str,
+        default=str(Path("~/projects/sudoku-image-solver").expanduser()),
+        help="Path to local sudoku-image-solver repo.",
     )
     parser.add_argument("--image", type=str, help="Path to input image for image mode.")
     parser.add_argument(
@@ -145,6 +175,7 @@ def parse_args() -> argparse.Namespace:
         help="Output path for image mode.",
     )
     parser.add_argument("--camera", type=int, default=0, help="Camera index for webcam mode.")
+
     return parser.parse_args()
 
 
