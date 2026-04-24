@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+assets/demo/*.mp4
+assets/demo/*.mov
+assets/demo/*.avi
+assets/demo/*.gif
+assets/demo/*.jpg
+assets/demo/*.png

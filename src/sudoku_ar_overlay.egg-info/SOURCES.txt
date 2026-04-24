@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/sudoku_ar_overlay/__init__.py
+src/sudoku_ar_overlay/board_state.py
+src/sudoku_ar_overlay/config.py
+src/sudoku_ar_overlay/overlay.py
+src/sudoku_ar_overlay/smoothing.py
+src/sudoku_ar_overlay/solver_adapter.py
+src/sudoku_ar_overlay.egg-info/PKG-INFO
+src/sudoku_ar_overlay.egg-info/SOURCES.txt
+src/sudoku_ar_overlay.egg-info/dependency_links.txt
+src/sudoku_ar_overlay.egg-info/requires.txt
+src/sudoku_ar_overlay.egg-info/top_level.txt
