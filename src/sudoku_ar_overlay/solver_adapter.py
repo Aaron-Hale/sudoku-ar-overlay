@@ -254,6 +254,48 @@ def real_solver_result(frame_bgr: np.ndarray, repo_root: str | Path) -> SolverRe
     )
 
 
+
+
+def detect_board_corners_only(
+    frame_bgr: np.ndarray,
+    repo_root: str | Path = "~/projects/sudoku-image-solver",
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Run segmentation only and return detected board corners.
+
+    This is the lightweight tracking path. It avoids OCR and Sudoku solving so the
+    live app can update the board plane more often than it solves.
+    """
+    if frame_bgr is None:
+        raise ValueError("frame_bgr cannot be None")
+
+    repo_root = Path(repo_root).expanduser().resolve()
+
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from src.sudoku_solver.inference import (
+        DEVICE,
+        corners_from_segmentation_prob,
+        predict_mask_prob_letterbox,
+        unletterbox_points,
+    )
+
+    runtime = load_solver_runtime(repo_root)
+
+    t0 = time.perf_counter()
+    prob, lb_meta, _ = predict_mask_prob_letterbox(
+        runtime["seg_model"],
+        frame_bgr,
+        runtime["seg_image_size"],
+        DEVICE,
+    )
+    pred_pts_lb, _, _ = corners_from_segmentation_prob(prob, post_thr=0.5)
+    pred_pts_orig = unletterbox_points(pred_pts_lb, lb_meta).astype(np.float32)
+    segmentation_ms = (time.perf_counter() - t0) * 1000.0
+
+    return pred_pts_orig.astype(np.float32), {"segmentation_ms": segmentation_ms}
+
+
 def solve_frame(
     frame_bgr: np.ndarray,
     solver: str = "mock",
