@@ -12,3 +12,16 @@ assets/demo/*.png
 # Python packaging metadata
 *.egg-info/
 src/*.egg-info/
+
+# Generated demo artifacts
+assets/demo/*.mp4
+assets/demo/*.mov
+assets/demo/*.avi
+assets/demo/*.log
+assets/demo/*_debug/
+assets/demo/*debug*/
+assets/demo/compare_frames/
+assets/demo/reacq_debug_frames/
+assets/demo/reacq_stability_debug/
+assets/demo/second_puzzle_debug/
+assets/demo/second_puzzle_segmentation_debug/
