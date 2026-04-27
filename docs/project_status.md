@@ -1368,3 +1368,39 @@ The right portfolio piece is:
 
 This is the most credible and shippable 3-week plan for an MLE-oriented portfolio project.
 
+
+---
+
+## 20. Update — Recorded Video Mode and First Optical-Flow Video Success
+
+**Date:** 2026-04-24  
+**Current branch:** `markerless-video-demo`
+
+### 20.1 Current strategic direction
+
+The active project direction remains:
+
+> Build a markerless, recorded-iPhone-video Sudoku AR overlay system with confidence-gated tracking and look-away/look-back reacquisition.
+
+This supersedes the earlier ArUco-assisted direction. ArUco remains useful as a diagnostic idea, but it is not part of the final user-facing product path.
+
+The final demo should work on a normal Sudoku puzzle without printed fiducials, QR codes, AprilTags, ArUco markers, or custom board markers.
+
+### 20.2 Recent repo commits
+
+Recent confirmed commits:
+
+- `624c190` — Update README for markerless recorded-video direction
+- `648668f` — Pivot roadmap to markerless recorded-video demo
+- `f9e25bf` — Add recorded video processing mode
+- `98bdea3` — Restore OpenCV dependency after contrib import issue
+- `48bd61f` — Add markerless flow tracking prototype and revise roadmap
+
+The `README.md` now reflects the markerless recorded-video direction.
+
+The repo was confirmed clean after the README update:
+
+```text
+On branch markerless-video-demo
+nothing to commit, working tree clean
+
