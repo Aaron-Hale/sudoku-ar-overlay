@@ -1,5 +1,13 @@
 # sudoku-ar-overlay
 
+A markerless, recorded-video planar AR-style overlay for Sudoku solving.
+
+This project extends [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) from a static image inference pipeline into a video perception system. It solves a Sudoku puzzle from a clean frame, projects the missing answers onto the board plane, tracks the board with optical-flow homography, hides the overlay when tracking confidence drops, and reacquires known boards using grid refinement, stability gating, and board identity caching.
+
+> This is not visual odometry, SLAM, ARKit, or ARCore. It is a bounded planar tracking system for a flat object.
+
+---
+
 ## Demo
 
 ![Markerless Sudoku AR overlay demo](docs/images/final_demo_preview.gif)
@@ -10,29 +18,7 @@
 **Debug / stress demo:**  
 [Watch `processed_iphone_aggressive_known_board_identity.mp4`](https://github.com/Aaron-Hale/sudoku-ar-overlay/releases/download/markerless-video-demo-v1/processed_iphone_aggressive_known_board_identity.mp4)
 
-The demo videos are generated artifacts and are intentionally ignored by Git. The small GIF preview above is committed for quick README viewing; full MP4s are published through the GitHub Release.
-
-## Demo
-
-Primary local demo output:
-
-```text
-assets/demo/final_demo_clean.mp4
-```
-
-Debug/stress demo output:
-
-```text
-assets/demo/processed_iphone_aggressive_known_board_identity.mp4
-```
-
-The demo videos are generated artifacts and are intentionally ignored by Git. Use the run scripts below to reproduce them locally.
-
-Recommended publishing flow:
-
-- keep raw/processed videos out of Git
-- upload the clean demo MP4 to a GitHub Release or portfolio page
-- optionally add a small GIF or screenshot to the README later
+The MP4 demo videos are generated artifacts and are intentionally ignored by Git. The small GIF preview above is committed for quick README viewing; the full MP4s are published through the GitHub Release.
 
 ---
 
@@ -386,7 +372,6 @@ Possible next improvements:
 - Best-candidate solve ranking across a candidate cluster
 - Stronger board identity model
 - Lightweight template matching for faster known-board reacquisition
-- Cleaner demo GIF generation
 - More formal evaluation across multiple videos
 - Optional mobile/native AR implementation
 - Optional ARKit/ARCore prototype
