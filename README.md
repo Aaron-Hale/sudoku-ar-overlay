@@ -2,6 +2,8 @@
 
 ## Demo
 
+![Markerless Sudoku AR overlay demo](docs/images/final_demo_preview.gif)
+
 **Clean demo:**  
 [Watch `final_demo_clean.mp4`](https://github.com/Aaron-Hale/sudoku-ar-overlay/releases/download/markerless-video-demo-v1/final_demo_clean.mp4)
 
