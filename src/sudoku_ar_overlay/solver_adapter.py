@@ -49,29 +49,88 @@ def is_valid(grid: np.ndarray, row: int, col: int, val: int) -> bool:
     return True
 
 
-def solve_sudoku(grid: np.ndarray) -> bool:
-    empty = find_empty(grid)
+def solve_sudoku(grid):
+    """Solve Sudoku in-place using fail-fast MRV backtracking.
 
-    if empty is None:
+    OCR mistakes can create contradictory givens. A naive first-empty-cell
+    backtracker can spend a long time searching those invalid grids. This
+    version validates givens up front and always branches on the empty cell
+    with the fewest legal candidates.
+    """
+
+    digits = set(range(1, 10))
+
+    def has_duplicate_nonzero(values):
+        vals = [int(v) for v in values if int(v) != 0]
+        return len(vals) != len(set(vals))
+
+    # Fast contradiction checks on rows, columns, and boxes.
+    for r in range(9):
+        if has_duplicate_nonzero(grid[r]):
+            return False
+
+    for c in range(9):
+        if has_duplicate_nonzero([grid[r][c] for r in range(9)]):
+            return False
+
+    for br in range(0, 9, 3):
+        for bc in range(0, 9, 3):
+            block = [
+                grid[r][c]
+                for r in range(br, br + 3)
+                for c in range(bc, bc + 3)
+            ]
+            if has_duplicate_nonzero(block):
+                return False
+
+    def candidates_for(r, c):
+        used = set(int(v) for v in grid[r])
+        used.update(int(grid[i][c]) for i in range(9))
+
+        br = (r // 3) * 3
+        bc = (c // 3) * 3
+        used.update(
+            int(grid[i][j])
+            for i in range(br, br + 3)
+            for j in range(bc, bc + 3)
+        )
+
+        used.discard(0)
+        return digits - used
+
+    best_cell = None
+    best_candidates = None
+
+    for r in range(9):
+        for c in range(9):
+            if int(grid[r][c]) == 0:
+                cand = candidates_for(r, c)
+
+                if not cand:
+                    return False
+
+                if best_candidates is None or len(cand) < len(best_candidates):
+                    best_cell = (r, c)
+                    best_candidates = cand
+
+                    if len(best_candidates) == 1:
+                        break
+
+        if best_candidates is not None and len(best_candidates) == 1:
+            break
+
+    if best_cell is None:
         return True
 
-    r, c = empty
+    r, c = best_cell
 
-    for val in range(1, 10):
-        if is_valid(grid, r, c, val):
-            grid[r, c] = val
-
-            if solve_sudoku(grid):
-                return True
-
-            grid[r, c] = 0
+    for val in sorted(best_candidates):
+        grid[r][c] = val
+        if solve_sudoku(grid):
+            return True
+        grid[r][c] = 0
 
     return False
-
-
-# --------------------------
-# Mock solver
-# --------------------------
 def mock_solver_result(frame_bgr: np.ndarray) -> SolverResult:
     """Temporary mock result for building the AR layer before wiring live tracking."""
     start = time.perf_counter()

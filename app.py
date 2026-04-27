@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import time
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import cv2
 from sudoku_ar_overlay.board_state import BoardSession, BoardStatus
 from sudoku_ar_overlay.config import OverlayConfig, TrackingConfig
 from sudoku_ar_overlay.flow_tracker import FlowHomographyTracker
+from sudoku_ar_overlay.grid_validation import validate_sudoku_grid_candidate
 from sudoku_ar_overlay.overlay import draw_board_outline, render_solution_overlay
 from sudoku_ar_overlay.smoothing import smooth_corners
 from sudoku_ar_overlay.solver_adapter import (
@@ -23,6 +25,40 @@ from sudoku_ar_overlay.tracking import score_corners
 
 def count_givens(givens) -> int:
     return sum(1 for row in givens for value in row if int(value) != 0)
+
+
+
+class SolveTimeoutError(RuntimeError):
+    pass
+
+
+def _solve_timeout_handler(signum, frame):
+    raise SolveTimeoutError("solve_frame timed out")
+
+
+def solve_frame_with_timeout(frame, args: argparse.Namespace):
+    timeout_sec = float(getattr(args, "solve_timeout_sec", 0.0) or 0.0)
+
+    if timeout_sec <= 0:
+        return solve_frame(
+            frame,
+            solver=args.solver,
+            repo_root=args.repo_root,
+        )
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _solve_timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_sec)
+
+    try:
+        return solve_frame(
+            frame,
+            solver=args.solver,
+            repo_root=args.repo_root,
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def print_solver_result(result) -> None:
@@ -58,11 +94,7 @@ def solve_and_update_session(
 ) -> tuple[bool, str]:
     try:
         print(f"Solving frame {frame_idx} with solver={args.solver}...")
-        result = solve_frame(
-            frame,
-            solver=args.solver,
-            repo_root=args.repo_root,
-        )
+        result = solve_frame_with_timeout(frame, args)
 
         smoothed = smooth_corners(
             session.smoothed_corners,
@@ -93,11 +125,7 @@ def solve_and_update_session(
 def run_image_mode(args: argparse.Namespace) -> None:
     frame = load_image_bgr(args.image)
 
-    result = solve_frame(
-        frame,
-        solver=args.solver,
-        repo_root=args.repo_root,
-    )
+    result = solve_frame_with_timeout(frame, args)
 
     out = render_solution_overlay(
         frame=frame,
@@ -473,34 +501,35 @@ def run_video_mode(args: argparse.Namespace) -> None:
     reacquisition_events = 0
     tracking_frames = 0
     lost_frames = 0
+    discovery_solve_attempts = 0
+    last_discovery_solve_frame = -1_000_000
 
     started = time.perf_counter()
 
     def mark_lost(reason: str) -> None:
-        nonlocal flow_ok, last_reason, loss_events, last_good_area_px
+        nonlocal solved, flow_ok, last_reason, loss_events, last_good_area_px
         nonlocal pending_reacq_corners, pending_reacq_count
 
         flow_ok = False
+        solved = False
         last_reason = reason
         flow.reset()
 
-        # Once tracking is lost, old board corners should not influence reacquisition.
-        # Keep the solved grid/session, but clear stale geometry.
-        session.last_corners = None
-        session.smoothed_corners = None
+        # Hard reset: old geometry and old solution are now unsafe.
+        # The next visible puzzle must be discovered and solved fresh.
+        session.reset()
         session.tracking_quality = 0.0
+
         last_good_area_px = None
         pending_reacq_corners = None
         pending_reacq_count = 0
 
-        if session.status != BoardStatus.TRACKING_LOST:
-            loss_events += 1
-        session.status = BoardStatus.TRACKING_LOST
+        loss_events += 1
 
     def validate_tracked_corners(corners, previous_corners, frame_shape) -> tuple[bool, str, float]:
         nonlocal last_good_area_px
 
-        h, w = frame_shape[:2]
+        h, w = frame.shape[:2]
         frame_area = float(h * w)
         max_dim = float(max(h, w))
 
@@ -524,7 +553,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
         scored = score_corners(
             corners,
-            frame_shape=frame_shape,
+            frame_shape=frame.shape,
             previous_corners=previous_corners,
         )
 
@@ -536,7 +565,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
         return True, "ok", area
 
-    def validate_reacq_candidate(corners, frame_shape):
+    def validate_reacq_candidate(corners, frame):
         """Validate segmentation output during reacquisition.
 
         This creates the effective "no puzzle detected" path:
@@ -545,14 +574,14 @@ def run_video_mode(args: argparse.Namespace) -> None:
         """
         scored = score_corners(
             corners,
-            frame_shape=frame_shape,
+            frame_shape=frame.shape,
             previous_corners=None,  # do not bias toward old lost position
         )
 
         if not scored.detected or scored.corners is None:
             return False, f"reacq score failed: {scored.reason}", None, 0.0
 
-        h, w = frame_shape[:2]
+        h, w = frame.shape[:2]
         frame_area = float(h * w)
         area = _quad_area_px(scored.corners)
         area_frac = area / frame_area if frame_area > 0 else 0.0
@@ -566,7 +595,168 @@ def run_video_mode(args: argparse.Namespace) -> None:
         if scored.quality < args.reacquire_min_score_quality:
             return False, f"reacq low quality: q={scored.quality:.2f}", None, area
 
-        return True, f"reacq candidate ok: q={scored.quality:.2f} area={area_frac:.3f}", scored.corners, area
+        grid_result = validate_sudoku_grid_candidate(
+            frame,
+            scored.corners,
+            min_peak=args.grid_min_peak,
+            min_strong_lines=args.grid_min_strong_lines,
+        )
+
+        if not grid_result.ok:
+            return False, f"reacq {grid_result.reason}", None, area
+
+        return (
+            True,
+            f"reacq candidate ok: q={scored.quality:.2f} area={area_frac:.3f}; {grid_result.reason}",
+            scored.corners,
+            area,
+        )
+
+
+    def initialize_from_fresh_solve(frame, frame_idx: int, label: str) -> bool:
+        """Run a fresh solve and initialize optical flow.
+
+        Used for initial detection and for new-board discovery after implausible motion.
+        """
+        nonlocal solved, flow_ok, last_error, last_reason, last_good_area_px
+        nonlocal pending_reacq_corners, pending_reacq_count, reacquisition_events
+
+        ok, last_error = solve_and_update_session(
+            frame=frame,
+            session=session,
+            args=args,
+            frame_idx=frame_idx,
+            tracking_cfg=tracking_cfg,
+        )
+
+        if not ok or session.smoothed_corners is None:
+            solved = False
+            flow_ok = False
+            session.reset()
+            last_reason = f"{label}: solve failed"
+            return False
+
+        init_result = flow.initialize(frame, session.smoothed_corners)
+
+        if init_result.ok and init_result.corners is not None:
+            solved = True
+            flow_ok = True
+            session.smoothed_corners = init_result.corners
+            session.last_corners = init_result.corners
+            session.last_seen_frame_idx = frame_idx
+            session.status = BoardStatus.SOLVED_TRACKING
+            session.tracking_quality = 1.0
+            last_good_area_px = _quad_area_px(init_result.corners)
+            pending_reacq_corners = None
+            pending_reacq_count = 0
+            last_reason = f"{label}: solved and initialized flow"
+            return True
+
+        solved = False
+        flow_ok = False
+        session.reset()
+        pending_reacq_corners = None
+        pending_reacq_count = 0
+        last_reason = f"{label}: flow init failed: {init_result.reason}"
+        return False
+
+
+    def discover_candidate_and_maybe_solve(frame, frame_idx: int) -> None:
+        """Cheap-ish discovery gate before running a fresh solve.
+
+        This prevents repeated full solves on random background frames.
+        """
+        nonlocal flow_ok, last_reason, last_track_ms
+        nonlocal pending_reacq_corners, pending_reacq_count
+        nonlocal discovery_solve_attempts, last_discovery_solve_frame
+
+        try:
+            t0 = time.perf_counter()
+            corners, timing = detect_board_corners_only(
+                frame,
+                repo_root=args.repo_root,
+            )
+            last_track_ms = timing.get(
+                "segmentation_ms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
+
+            cand_ok, cand_reason, cand_corners, _ = validate_reacq_candidate(
+                corners,
+                frame,
+            )
+
+            if not cand_ok or cand_corners is None:
+                pending_reacq_corners = None
+                pending_reacq_count = 0
+                flow_ok = False
+                last_reason = f"discover rejected: {cand_reason}"
+                return
+
+            if pending_reacq_corners is None:
+                pending_reacq_corners = cand_corners.copy()
+                pending_reacq_count = 1
+                flow_ok = False
+                last_reason = (
+                    f"discover pending {pending_reacq_count}/"
+                    f"{args.discover_confirm_frames}: {cand_reason}"
+                )
+                return
+
+            shift = _mean_corner_jump_px(cand_corners, pending_reacq_corners)
+            max_dim = float(max(frame.shape[:2]))
+
+            if shift > max_dim * args.reacquire_max_candidate_shift_frac:
+                pending_reacq_corners = cand_corners.copy()
+                pending_reacq_count = 1
+                flow_ok = False
+                last_reason = f"discover candidate moved/reset: shift={shift:.1f}px"
+                return
+
+            pending_reacq_corners = cand_corners.copy()
+            pending_reacq_count += 1
+            last_reason = (
+                f"discover pending {pending_reacq_count}/"
+                f"{args.discover_confirm_frames}: shift={shift:.1f}px"
+            )
+
+            if pending_reacq_count >= args.discover_confirm_frames:
+                if args.enable_discovery_solve:
+                    frames_since_attempt = frame_idx - last_discovery_solve_frame
+
+                    if discovery_solve_attempts >= args.discover_max_solve_attempts:
+                        flow_ok = False
+                        last_reason = (
+                            "discover confirmed candidate, but max fresh-solve "
+                            f"attempts reached: {discovery_solve_attempts}"
+                        )
+                    elif frames_since_attempt < args.discover_solve_cooldown_frames:
+                        flow_ok = False
+                        last_reason = (
+                            "discover confirmed candidate, but solve cooldown active: "
+                            f"{frames_since_attempt}/{args.discover_solve_cooldown_frames} frames"
+                        )
+                    else:
+                        discovery_solve_attempts += 1
+                        last_discovery_solve_frame = frame_idx
+                        initialize_from_fresh_solve(
+                            frame=frame,
+                            frame_idx=frame_idx,
+                            label="fresh discovery",
+                        )
+                else:
+                    flow_ok = False
+                    last_reason = (
+                        "discover confirmed candidate, but fresh solve disabled "
+                        "(use --enable-discovery-solve to allow it)"
+                    )
+
+        except Exception as exc:
+            pending_reacq_corners = None
+            pending_reacq_count = 0
+            flow_ok = False
+            last_reason = f"discover failed: {type(exc).__name__}: {exc}"
+
 
 
     print(f"Reading video: {args.input}")
@@ -590,30 +780,20 @@ def run_video_mode(args: argparse.Namespace) -> None:
             if not writer.isOpened():
                 raise RuntimeError(f"Could not open video writer: {out_path}")
 
-        # Solve once on selected frame and initialize flow tracker.
+        # Initial solve and subsequent fresh discovery.
         if frame_idx == args.solve_frame and not solved:
-            solved, last_error = solve_and_update_session(
+            initialize_from_fresh_solve(
                 frame=frame,
-                session=session,
-                args=args,
                 frame_idx=frame_idx,
-                tracking_cfg=tracking_cfg,
+                label="initial solve",
             )
 
-            if solved and session.smoothed_corners is not None:
-                init_result = flow.initialize(frame, session.smoothed_corners)
-                flow_ok = bool(init_result.ok)
-
-                if init_result.ok and init_result.corners is not None:
-                    session.smoothed_corners = init_result.corners
-                    session.last_corners = init_result.corners
-                    session.last_seen_frame_idx = frame_idx
-                    session.status = BoardStatus.SOLVED_TRACKING
-                    session.tracking_quality = 1.0
-                    last_good_area_px = _quad_area_px(init_result.corners)
-                    last_reason = f"flow initialized: {init_result.reason}"
-                else:
-                    mark_lost(f"flow init failed: {init_result.reason}")
+        elif (
+            not solved
+            and frame_idx > args.solve_frame
+            and frame_idx % max(args.discover_every_n_frames, 1) == 0
+        ):
+            discover_candidate_and_maybe_solve(frame, frame_idx)
 
         # Fast per-frame optical-flow tracking while board is visible.
         elif solved and flow.initialized and session.status != BoardStatus.TRACKING_LOST:
@@ -949,6 +1129,41 @@ def parse_args() -> argparse.Namespace:
         help="When tracking is lost in video mode, try segmentation reacquisition every N frames.",
     )
     parser.add_argument(
+        "--discover-every-n-frames",
+        type=int,
+        default=10,
+        help="When no board is being tracked, try fresh board discovery every N frames.",
+    )
+    parser.add_argument(
+        "--discover-confirm-frames",
+        type=int,
+        default=2,
+        help="Require this many stable discovery candidates before running a fresh solve.",
+    )
+    parser.add_argument(
+        "--enable-discovery-solve",
+        action="store_true",
+        help="Allow discovery mode to run a fresh full solve after confirmed candidate detections.",
+    )
+    parser.add_argument(
+        "--solve-timeout-sec",
+        type=float,
+        default=2.5,
+        help="Max seconds allowed for each solve attempt. Use 0 to disable timeout.",
+    )
+    parser.add_argument(
+        "--discover-solve-cooldown-frames",
+        type=int,
+        default=90,
+        help="Minimum frames between fresh solve attempts during discovery.",
+    )
+    parser.add_argument(
+        "--discover-max-solve-attempts",
+        type=int,
+        default=3,
+        help="Maximum fresh solve attempts during discovery for one video.",
+    )
+    parser.add_argument(
         "--reacquire-with-solve",
         action="store_true",
         default=False,
@@ -974,6 +1189,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reacquire-min-score-quality", type=float, default=0.45)
     parser.add_argument("--reacquire-min-board-area-frac", type=float, default=0.025)
+    parser.add_argument(
+        "--grid-min-peak",
+        type=float,
+        default=0.025,
+        help="Minimum grid-line peak contrast required for discovery/reacquisition candidates.",
+    )
+    parser.add_argument(
+        "--grid-min-strong-lines",
+        type=int,
+        default=7,
+        help="Minimum expected vertical/horizontal Sudoku grid lines required.",
+    )
     parser.add_argument("--reacquire-max-board-area-frac", type=float, default=0.80)
     parser.add_argument("--reacquire-max-candidate-shift-frac", type=float, default=0.18)
 
