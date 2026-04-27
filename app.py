@@ -389,12 +389,219 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
     cv2.destroyAllWindows()
 
 
+
+def run_video_mode(args: argparse.Namespace) -> None:
+    """Process a recorded video and write an annotated output video.
+
+    First implementation:
+    - read frames from --input
+    - solve once at --solve-frame
+    - optionally run segmentation-only tracking every N frames
+    - render cached solution when tracking is confident
+    - hide overlay when tracking is lost
+    - write output MP4
+    """
+    if not args.input:
+        raise ValueError("--input is required for video mode.")
+
+    cap = cv2.VideoCapture(args.input)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open input video: {args.input}")
+
+    input_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not input_fps or input_fps <= 1:
+        input_fps = 30.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    out_path = Path(args.out)
+    if out_path.suffix.lower() not in {".mp4", ".mov", ".avi"}:
+        out_path = Path("assets/demo/processed_video_overlay.mp4")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    session = BoardSession()
+    overlay_cfg = OverlayConfig()
+    tracking_cfg = TrackingConfig(
+        smoothing_alpha=args.smoothing_alpha,
+        lost_after_frames=args.lost_after_tracking_attempts,
+        detection_every_n_frames=args.track_every_n_frames,
+    )
+
+    stabilizer = CornerStabilizer(
+        median_window=args.stabilizer_median_window,
+        min_quality=args.stabilizer_min_quality,
+        static_alpha=args.stabilizer_static_alpha,
+        moving_alpha=args.stabilizer_moving_alpha,
+        static_motion_px=args.stabilizer_static_motion_px,
+        fast_motion_px=args.stabilizer_fast_motion_px,
+        max_jump_ratio=args.stabilizer_max_jump_ratio,
+    )
+
+    writer = None
+    frame_idx = 0
+    processed_frames = 0
+    tracking_attempts_since_seen = 0
+
+    last_error = ""
+    last_track_reason = ""
+    last_track_ms = 0.0
+    last_stabilizer_alpha = 0.0
+    last_mean_motion_px = 0.0
+
+    loss_events = 0
+    reacquisition_events = 0
+    solved = False
+
+    started = time.perf_counter()
+
+    print(f"Reading video: {args.input}")
+    print(f"Writing video: {out_path}")
+    print(f"Input FPS: {input_fps:.2f}")
+    print(f"Total frames: {total_frames if total_frames else 'unknown'}")
+    print(f"Solve frame: {args.solve_frame}")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        if args.video_max_frames > 0 and processed_frames >= args.video_max_frames:
+            break
+
+        if writer is None:
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(out_path), fourcc, input_fps, (w, h))
+            if not writer.isOpened():
+                raise RuntimeError(f"Could not open video writer: {out_path}")
+
+        previous_status = session.status
+
+        # Solve once on the requested frame.
+        if frame_idx == args.solve_frame and not solved:
+            solved, last_error = solve_and_update_session(
+                frame=frame,
+                session=session,
+                args=args,
+                frame_idx=frame_idx,
+                tracking_cfg=tracking_cfg,
+            )
+
+        # Optional segmentation-only tracking/reacquisition.
+        should_track_this_frame = (
+            args.track_board
+            and frame_idx % max(args.track_every_n_frames, 1) == 0
+        )
+
+        if should_track_this_frame:
+            detected, reason, track_ms, stab_alpha, mean_motion_px = update_board_tracking(
+                frame=frame,
+                session=session,
+                args=args,
+                frame_idx=frame_idx,
+                stabilizer=stabilizer,
+            )
+
+            last_track_reason = reason
+            last_track_ms = track_ms
+            last_stabilizer_alpha = stab_alpha
+            last_mean_motion_px = mean_motion_px
+
+            if detected:
+                tracking_attempts_since_seen = 0
+            else:
+                tracking_attempts_since_seen += 1
+
+                if (
+                    session.solution is not None
+                    and tracking_attempts_since_seen >= args.lost_after_tracking_attempts
+                ):
+                    session.status = BoardStatus.TRACKING_LOST
+
+                if session.solution is None:
+                    session.status = BoardStatus.NO_BOARD
+
+        if session.status == BoardStatus.TRACKING_LOST and previous_status != BoardStatus.TRACKING_LOST:
+            loss_events += 1
+
+        if session.status == BoardStatus.REACQUIRED and previous_status == BoardStatus.TRACKING_LOST:
+            reacquisition_events += 1
+
+        display = frame.copy()
+
+        if (
+            session.solution is None
+            and session.smoothed_corners is not None
+            and session.status == BoardStatus.BOARD_DETECTED
+        ):
+            display = draw_board_outline(display, session.smoothed_corners)
+
+        if (
+            session.status in {BoardStatus.SOLVED_TRACKING, BoardStatus.REACQUIRED}
+            and session.givens is not None
+            and session.solution is not None
+            and session.smoothed_corners is not None
+        ):
+            display = render_solution_overlay(
+                frame=display,
+                corners=session.smoothed_corners,
+                givens=session.givens,
+                solution=session.solution,
+                cfg=overlay_cfg,
+            )
+
+            if session.status == BoardStatus.REACQUIRED:
+                session.status = BoardStatus.SOLVED_TRACKING
+
+        if args.debug:
+            lines = [
+                (
+                    f"state={session.status.value} frame={frame_idx} "
+                    f"solve_ms={session.solve_latency_ms:.1f} "
+                    f"track_ms={last_track_ms:.1f} q={session.tracking_quality:.2f}"
+                ),
+                (
+                    f"track={args.track_board} every={args.track_every_n_frames} "
+                    f"stab_a={last_stabilizer_alpha:.2f} "
+                    f"motion={last_mean_motion_px:.1f}px"
+                ),
+                f"loss_events={loss_events} reacq_events={reacquisition_events}",
+            ]
+
+            if last_track_reason:
+                lines.append(f"tracking: {last_track_reason[:90]}")
+            if last_error:
+                lines.append(last_error[:95])
+
+            draw_text_lines(display, lines)
+
+        writer.write(display)
+
+        frame_idx += 1
+        processed_frames += 1
+
+    elapsed = time.perf_counter() - started
+
+    if writer is not None:
+        writer.release()
+    cap.release()
+
+    print(f"Wrote output video: {out_path}")
+    print(f"Processed frames: {processed_frames}")
+    print(f"Wall time: {elapsed:.2f} sec")
+    if elapsed > 0:
+        print(f"Processing FPS: {processed_frames / elapsed:.2f}")
+    print(f"Final state: {session.status.value}")
+    print(f"Solve latency ms: {session.solve_latency_ms:.2f}")
+    print(f"Tracking loss events: {loss_events}")
+    print(f"Reacquisition events: {reacquisition_events}")
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="sudoku-ar-overlay")
 
     parser.add_argument(
         "--mode",
-        choices=["image", "webcam"],
+        choices=["image", "webcam", "video"],
         required=True,
         help="Run a static image overlay or webcam overlay.",
     )
@@ -411,6 +618,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to local sudoku-image-solver repo.",
     )
     parser.add_argument("--image", type=str, help="Path to input image for image mode.")
+    parser.add_argument("--input", type=str, help="Path to input video for video mode.")
+    parser.add_argument("--solve-frame", type=int, default=0, help="Frame index to solve in video mode.")
+    parser.add_argument("--video-max-frames", type=int, default=0, help="Maximum frames to process in video mode; 0 means all frames.")
     parser.add_argument(
         "--out",
         type=str,
@@ -478,6 +688,10 @@ def main() -> None:
         if not args.image:
             raise ValueError("--image is required for image mode.")
         run_image_mode(args)
+        return
+
+    if args.mode == "video":
+        run_video_mode(args)
         return
 
     if args.mode == "webcam":
