@@ -1404,3 +1404,726 @@ The repo was confirmed clean after the README update:
 On branch markerless-video-demo
 nothing to commit, working tree clean
 
+
+---
+
+
+## 21. Update — Fail-Closed Tracking, Grid-First Discovery, Reacquisition Debugging, and Next Architecture Decision
+
+**Date:** 2026-04-24  
+**Current branch:** `markerless-video-demo`
+
+### 21.1 Summary of where we are now
+
+Since the last update, the project moved from “can we track at all?” to a more precise perception-system problem:
+
+> The app can solve a clean starting frame, track the board well under moderate motion, and fail closed when the board leaves frame. The remaining hard problem is robust reacquisition: finding the returned Sudoku board quickly, validating whether it is the same puzzle or a new puzzle, and fitting the overlay accurately before rendering.
+
+Confirmed improvements:
+
+- recorded-video mode works
+- initial solve works quickly on clean starting frames
+- optical-flow tracking works well while the board is visible
+- moderate motion is handled much better than webcam / segmentation-only tracking
+- the overlay now hides when tracking becomes implausible
+- rug/carpet false positives can be rejected with grid validation
+- the codebase now has a path toward grid-first discovery and identity-aware reacquisition
+
+Current remaining gaps:
+
+- reacquisition is still too slow
+- reacquired overlay fit can be skewed
+- returned moving / side-entering puzzles can produce rough or premature corners
+- same-puzzle versus new-puzzle policy still needs to be implemented cleanly
+- several local changes are uncommitted and should be reviewed before committing
+
+### 21.2 Important confirmed behavior from the latest video tests
+
+The latest iPhone video test showed:
+
+```text
+Initial board visible:
+  solves quickly and accurately
+
+Board in motion:
+  optical-flow tracking is good under moderate movement
+
+Camera/board moves away:
+  overlay cuts off / hides correctly
+
+Board returns:
+  system finds something Sudoku-like, but reacquisition is slow
+  the overlay returns with a slightly skewed / poor fit
+```
+
+Interpretation:
+
+> The tracker is no longer the main blocker. The main blocker is reacquisition quality: finding the correct returned board, waiting until it is stable enough, refining its grid corners, and deciding whether to reuse the cached solution or solve fresh.
+
+### 21.3 Fail-closed behavior improved
+
+Earlier versions had a bad failure mode:
+
+```text
+board leaves frame
+→ optical flow keeps attaching the old overlay to random background
+```
+
+This was improved by adding motion / geometry plausibility checks:
+
+- board area change checks
+- corner jump checks
+- flow inlier checks
+- minimum board area checks
+- corner quality checks
+- tracking-loss state handling
+
+Current desired behavior:
+
+```text
+if flow result becomes implausible:
+  hide overlay immediately
+  stop rendering stale geometry
+  enter discovery/reacquisition mode
+```
+
+This is now mostly working and is an important product-quality milestone.
+
+### 21.4 Full-solve reacquisition was tested and found unsafe by itself
+
+We tested the idea:
+
+```text
+tracking lost
+→ run full solver again when a puzzle-like candidate appears
+→ if solve succeeds, initialize a new session
+```
+
+This is product-safe in theory because it avoids projecting an old solution onto a new puzzle.
+
+But the first implementation had serious issues:
+
+1. It could repeatedly call the full solver on bad/no-board frames.
+2. It could hang for many minutes.
+3. It was too brittle when candidate frames were transitional, blurred, moving, or misdetected.
+
+A safety patch was added:
+
+```text
+--reacquire-with-solve default=False
+```
+
+Later, bounded solving was added:
+
+```text
+--solve-timeout-sec
+--discover-solve-cooldown-frames
+--discover-max-solve-attempts
+```
+
+This prevented indefinite hangs, but it did not solve the underlying reacquisition-quality issue.
+
+### 21.5 The Sudoku solver hang was diagnosed and improved
+
+A major diagnostic finding:
+
+> Some failed reacquisition frames were not slow because segmentation or OCR was slow. They were slow because OCR produced an invalid givens grid, and the naive Sudoku backtracker spent too long trying to prove the grid unsolvable.
+
+The stack trace showed repeated recursion inside:
+
+```text
+solve_sudoku(grid)
+```
+
+A fail-fast MRV Sudoku solver was added in:
+
+```text
+src/sudoku_ar_overlay/solver_adapter.py
+```
+
+The MRV solver now:
+
+- checks for duplicate nonzero givens in rows, columns, and boxes
+- selects the empty cell with the fewest legal candidates
+- fails quickly on contradictory OCR output
+
+Result:
+
+```text
+bad OCR givens now fail quickly instead of hanging
+```
+
+This should stay in the project.
+
+### 21.6 Side-by-side frame debugging proved the issue was upstream of OCR/solve
+
+We compared two frames from the same iPhone video:
+
+```text
+frame 0010
+frame 0670
+```
+
+Frame `0010` solved cleanly:
+
+```text
+filled givens: 39
+duplicate issues: none
+MRV solve_sudoku result: True
+```
+
+Frame `0670` produced nonsense predicted givens:
+
+```text
+filled givens: 20
+mostly 2s and 5s
+duplicate issues in multiple rows, columns, and boxes
+MRV solve_sudoku result: False
+```
+
+At first this looked like OCR failure, but image diagnostics showed the deeper issue:
+
+> For frame `0670`, the detector was not finding the Sudoku board. It was warping a rug/carpet region and passing that into OCR.
+
+That explained why OCR predicted garbage digits.
+
+Conclusion:
+
+```text
+The solver was not failing on the puzzle.
+The detector/discovery path was selecting the wrong rectangle.
+```
+
+### 21.7 Grid validation was added and successfully rejected the rug false positive
+
+A new module was added:
+
+```text
+src/sudoku_ar_overlay/grid_validation.py
+```
+
+It includes:
+
+```text
+validate_sudoku_grid_candidate(...)
+warp_candidate(...)
+evaluate_sudoku_grid_fit(...)
+```
+
+The validator checks whether a warped candidate actually looks like a Sudoku grid by looking for repeated horizontal and vertical grid-line evidence.
+
+Diagnostic result:
+
+```text
+frame_0010 True  grid ok: score=0.160 v_peak=0.141 h_peak=0.179 v_lines=7 h_lines=10
+frame_0670 False grid rejected: score=-0.007 v_peak=-0.012 h_peak=-0.003 v_lines=1 h_lines=3
+```
+
+This was a major breakthrough.
+
+Interpretation:
+
+> The validator correctly accepts the real Sudoku board and rejects the rug false positive.
+
+This should remain in the project.
+
+### 21.8 Grid-first discovery was added
+
+A new module was added:
+
+```text
+src/sudoku_ar_overlay/grid_discovery.py
+```
+
+Purpose:
+
+> Find Sudoku-like grid candidates directly from line/contour structure instead of blindly trusting the segmentation detector.
+
+This was added because segmentation can return a plausible-looking rectangle that is not the Sudoku board.
+
+The intended discovery order is now:
+
+```text
+1. Try grid-first discovery.
+2. Validate candidate looks like a Sudoku grid.
+3. If grid discovery fails, optionally fall back to segmentation candidate.
+4. Reject anything that does not pass grid validation.
+```
+
+This is the right direction. It prevents false positives like carpet/rug candidates from reaching OCR or overlay rendering.
+
+### 21.9 Grid-fit validation was added but reacquired overlay fit is still imperfect
+
+A fit validator was added to check whether candidate corners align with expected Sudoku grid lines:
+
+```text
+evaluate_sudoku_grid_fit(...)
+```
+
+Purpose:
+
+```text
+candidate corners
+→ warp candidate
+→ compare expected grid-line positions to detected line peaks
+→ reject candidates whose projected grid is poorly aligned
+```
+
+This is meant to prevent skewed overlays.
+
+However, the latest output still shows:
+
+```text
+reacquired overlay appears slightly skewed
+```
+
+Current interpretation:
+
+> Grid-first discovery can find a Sudoku-like candidate, but the corners are still rough. The overlay needs refined grid-corner alignment before rendering.
+
+### 21.10 Pose-aware reacquisition policy was explored
+
+We discussed and started implementing a better policy using last known board pose.
+
+Store when tracking is lost:
+
+```text
+last_good_corners
+last_good_center
+last_good_area
+last_good_board_template/fingerprint later
+```
+
+For each new candidate:
+
+```text
+candidate_center
+candidate_area
+candidate_corners
+candidate_grid_fit
+```
+
+Use pose continuity:
+
+```text
+center movement from last known pose
+area ratio from last known pose
+candidate grid quality
+candidate fit quality
+```
+
+Policy:
+
+```text
+near last pose + good grid fit:
+  likely same puzzle
+  cached solution may be reused provisionally
+
+far from last pose + low similarity:
+  likely new puzzle
+  fresh solve required
+
+uncertain:
+  show nothing
+```
+
+This is the right high-level policy, but it is not fully stable yet.
+
+### 21.11 We decided cached reacquisition alone is unsafe
+
+There was a brief idea to reacquire using the cached solution instead of fresh solving.
+
+This was rejected as the default product behavior.
+
+Reason:
+
+```text
+A different puzzle could enter the frame.
+Reusing the old solution on a new puzzle would be a serious product failure.
+```
+
+The better policy is:
+
+```text
+same puzzle likely:
+  reuse cache provisionally for speed
+
+new puzzle likely:
+  require fresh solve
+
+uncertain:
+  show nothing
+```
+
+This led to the current recommended architecture:
+
+> Cached overlay can be used for fast known-puzzle reacquisition only if there is identity evidence, not merely because a Sudoku-like board appeared.
+
+### 21.12 Best architecture decision from this round
+
+The most robust/scalable answer is now:
+
+```text
+separate tracking, detection, identity, and solving
+```
+
+Roles:
+
+| Module | Responsibility |
+|---|---|
+| Tracker | Track current board frame-to-frame with optical flow/homography |
+| Detector | Find Sudoku-grid candidates when tracking is lost |
+| Grid validator | Reject false positives like carpet/rug/table texture |
+| Grid refiner | Improve rough detected corners to overlay-quality grid corners |
+| Identity verifier | Decide whether candidate is same puzzle or new puzzle |
+| Solver | Solve only when needed for a new puzzle or initial puzzle |
+
+This avoids the earlier mistake of letting one component do too much.
+
+### 21.13 Current recommended state machine
+
+Recommended final behavior:
+
+```text
+DISCOVERY
+  find stable Sudoku-grid candidate
+  solve fresh
+  cache solution + board fingerprint
+  initialize tracker
+  -> SOLVED_TRACKING
+
+SOLVED_TRACKING
+  optical flow updates corners every frame
+  render only while tracking quality is high
+  if motion/geometry implausible:
+    hide overlay
+    preserve last good pose + identity fingerprint
+    -> TRACKING_LOST
+
+TRACKING_LOST
+  show nothing
+  search for Sudoku-grid candidates
+  if candidate found:
+    -> CANDIDATE_REACQUIRED
+
+CANDIDATE_REACQUIRED
+  evaluate:
+    grid validity
+    grid fit
+    pose continuity
+    board fingerprint/template similarity
+
+  if likely same board:
+    optionally show cached overlay quickly/provisionally
+    validate in background
+    -> SOLVED_TRACKING
+
+  if likely new board:
+    hide overlay
+    fresh solve required
+    -> DISCOVERY / NEW_PUZZLE_SOLVING
+
+  if uncertain:
+    show nothing
+    collect more frames
+```
+
+### 21.14 Key insight: reacquisition is happening too early while the board is moving
+
+The latest video showed that the board returns from the side of the frame while moving.
+
+This creates a different condition than the initial solve:
+
+```text
+Initial solve:
+  board centered
+  board still
+  full puzzle visible
+  clean corners
+  accurate solve
+
+Reacquisition:
+  board entering from side
+  board moving
+  corners changing
+  partial/edge-frame views
+  rough/skewed candidate corners
+```
+
+Conclusion:
+
+> The system is reacquiring too early on a moving/transitioning object.
+
+Correct fix:
+
+```text
+candidate appears
+→ do not render immediately
+→ collect a short candidate buffer
+→ wait until candidate is stable for a few frames
+→ refine grid corners
+→ then render / solve / initialize flow
+```
+
+At 30 FPS, this does not need to be slow:
+
+```text
+3–5 stable frames = ~0.1–0.17 sec
+10 stable frames = ~0.33 sec
+```
+
+This is much better than showing a skewed overlay.
+
+### 21.15 Known-puzzle fast reacquisition idea
+
+For speed when the same known puzzle leaves and returns:
+
+```text
+solve initial board
+cache canonical board fingerprint/template
+when board returns:
+  detect candidate grid
+  warp candidate to canonical view
+  compare to cached fingerprint
+  if high similarity:
+    reuse cached solution quickly
+  if low similarity:
+    fresh solve required
+```
+
+This gives the best user experience:
+
+```text
+same puzzle returns:
+  overlay returns fast
+
+different puzzle appears:
+  old overlay is blocked
+  fresh solve required
+```
+
+This requires adding a board fingerprint/template module.
+
+Suggested cached data:
+
+```text
+cached solution
+cached givens
+canonical board crop/template
+edge-map template
+last good corners
+last good center
+last good area
+last exit side
+```
+
+Suggested same-board evidence:
+
+```text
+template similarity
+givens/grid layout similarity
+pose continuity
+scale continuity
+time since loss
+entry/exit side consistency
+```
+
+### 21.16 Entry/exit side should be used, but not alone
+
+We discussed whether the system should use where the puzzle left and where it returned.
+
+Decision:
+
+> Yes, use last pose / exit side / new candidate location as a signal, but not as the only decision rule.
+
+Example:
+
+```text
+board exits left and returns near left:
+  stronger same-puzzle evidence
+
+board exits left and candidate appears far right:
+  weaker same-puzzle evidence
+  likely new puzzle
+```
+
+But this should be combined with template similarity and grid fit because the same puzzle could re-enter elsewhere.
+
+Practical score components:
+
+```text
+same_board_score =
+  visual_template_similarity
++ givens/grid_layout_similarity
++ pose_continuity_score
++ scale_continuity_score
++ entry/exit side score
+```
+
+### 21.17 `app.py` got messy and was repaired
+
+The pose-aware/grid-fit patch created indentation errors in `app.py`.
+
+Observed errors:
+
+```text
+IndentationError: unexpected indent
+SyntaxError: expected 'except' or 'finally' block
+```
+
+Root cause:
+
+> Large text-substitution patches inserted `last_good_center_px` at incorrect indentation levels in multiple branches.
+
+Resolution:
+
+- full `app.py` was uploaded
+- a corrected `app_fixed.py` was generated
+- local `app.py` was replaced from the downloaded fixed file
+- `python -m py_compile app.py` passed
+
+This restored syntactic correctness.
+
+Important lesson:
+
+> Stop applying giant text replacements directly to `app.py`. Move reacquisition/identity logic into smaller modules before continuing.
+
+Recommended next structure:
+
+```text
+src/sudoku_ar_overlay/reacquisition.py
+src/sudoku_ar_overlay/board_identity.py
+src/sudoku_ar_overlay/grid_refinement.py
+```
+
+### 21.18 Current uncommitted local state
+
+After replacing `app.py`, the repo showed:
+
+```text
+ M app.py
+ M src/sudoku_ar_overlay/grid_validation.py
+?? app.py.before_full_file_fix
+?? app.py.broken_pose_patch_backup
+?? app.py.broken_reacq_patch
+?? assets/
+?? src/sudoku_ar_overlay/grid_discovery.py
+```
+
+`app.py` compiles.
+
+Do not commit backup files:
+
+```text
+app.py.before_full_file_fix
+app.py.broken_pose_patch_backup
+app.py.broken_reacq_patch
+```
+
+Do not commit large generated video/image assets yet unless choosing a final demo asset deliberately.
+
+Recommended cleanup before commit:
+
+```bash
+rm -f app.py.before_full_file_fix app.py.broken_pose_patch_backup app.py.broken_reacq_patch
+```
+
+Recommended staged commit once behavior is acceptable:
+
+```bash
+git add app.py \
+  src/sudoku_ar_overlay/grid_validation.py \
+  src/sudoku_ar_overlay/grid_discovery.py \
+  src/sudoku_ar_overlay/solver_adapter.py
+
+git commit -m "Add grid-first discovery and fail-closed video tracking"
+```
+
+But only commit after verifying the current behavior is not worse than the previous checkpoint.
+
+### 21.19 Current behavior assessment
+
+Current behavior:
+
+| Capability | Status |
+|---|---|
+| Initial static/image solve | Works |
+| Initial video solve | Works |
+| Optical-flow tracking while visible | Good |
+| Moderate motion handling | Good |
+| Hide overlay when board leaves | Much improved |
+| Reject carpet/rug false positives | Grid validator works |
+| Fresh solve on returned/moving frames | Unreliable |
+| Reacquisition speed | Still too slow |
+| Reacquired overlay fit | Still skewed |
+| Same-vs-new puzzle identity | Design chosen, not fully implemented |
+| Grid-corner refinement | Needed next |
+| Candidate stability buffer | Needed next |
+| Board fingerprint/template matching | Needed next |
+
+### 21.20 Recommended next technical step
+
+Do not keep tuning `app.py`.
+
+Next build should be modular:
+
+1. Add `grid_refinement.py`
+   - input: rough Sudoku candidate corners
+   - output: refined overlay-quality grid corners
+   - purpose: fix skewed reacquired overlay
+
+2. Add `reacquisition.py`
+   - input: candidate history buffer
+   - output: stable candidate only after motion settles
+   - purpose: avoid initializing overlay on moving/partial boards
+
+3. Add `board_identity.py`
+   - cache canonical board template at initial solve
+   - compare reacquired candidate to cached template
+   - purpose: fast same-puzzle reacquisition without blindly reusing old solution
+
+4. Update `app.py` only after the modules are tested independently.
+
+The next immediate diagnostic should be:
+
+```text
+take a returned-frame candidate
+run grid discovery
+run grid refinement
+draw rough vs refined corners
+verify refined corners hug the printed Sudoku grid
+```
+
+Only after that works should it be integrated into video mode.
+
+### 21.21 Current project interpretation
+
+The project has crossed an important threshold.
+
+Earlier question:
+
+> Can we turn the static Sudoku solver into a video AR overlay?
+
+Current answer:
+
+> Yes, for initial solve and moderate motion. The main remaining challenge is robust reacquisition.
+
+The hard part is now a real perception-system design problem:
+
+```text
+when the board disappears and returns, decide:
+  is this the same board?
+  is this a new board?
+  are the corners accurate enough to render?
+  is the board stable enough to solve/render?
+```
+
+This is actually a strong portfolio direction because it demonstrates applied judgment beyond simply drawing an overlay.
+
+The next portfolio-quality milestone is:
+
+> A known Sudoku board leaves frame, returns, is recognized as the same board via template/pose/grid evidence, waits briefly for stable geometry, refines its grid corners, and reattaches the cached overlay without skew.
+
+After that:
+
+> A different puzzle enters frame, cached overlay is blocked, and the system requires a fresh solve before rendering.

@@ -6,11 +6,13 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from sudoku_ar_overlay.board_state import BoardSession, BoardStatus
 from sudoku_ar_overlay.config import OverlayConfig, TrackingConfig
 from sudoku_ar_overlay.flow_tracker import FlowHomographyTracker
-from sudoku_ar_overlay.grid_validation import validate_sudoku_grid_candidate
+from sudoku_ar_overlay.grid_validation import validate_sudoku_grid_candidate, warp_candidate, evaluate_sudoku_grid_fit
+from sudoku_ar_overlay.grid_discovery import find_sudoku_grid_candidate
 from sudoku_ar_overlay.overlay import draw_board_outline, render_solution_overlay
 from sudoku_ar_overlay.smoothing import smooth_corners
 from sudoku_ar_overlay.solver_adapter import (
@@ -426,26 +428,36 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
 
 
 
+
+
 def _quad_area_px(corners) -> float:
-    return float(abs(cv2.contourArea(corners.reshape(-1, 1, 2).astype("float32"))))
+    arr = np.asarray(corners, dtype="float32").reshape(4, 2)
+    return float(abs(cv2.contourArea(arr.reshape(-1, 1, 2))))
+
+
+def _quad_center_px(corners) -> np.ndarray:
+    return np.asarray(corners, dtype="float32").reshape(4, 2).mean(axis=0)
 
 
 def _mean_corner_jump_px(current, previous) -> float:
     if current is None or previous is None:
         return 0.0
-    diff = current.astype("float32") - previous.astype("float32")
-    dists = ((diff ** 2).sum(axis=1) ** 0.5)
+    cur = np.asarray(current, dtype="float32").reshape(4, 2)
+    prev = np.asarray(previous, dtype="float32").reshape(4, 2)
+    dists = np.linalg.norm(cur - prev, axis=1)
     return float(dists.mean())
 
 
 def run_video_mode(args: argparse.Namespace) -> None:
     """Process a recorded video and write an annotated output video.
 
-    Uses:
+    Cleaned video state machine:
     - solve once on --solve-frame
-    - optical-flow homography tracking while confidence is good
-    - fail-closed behavior when tracking becomes implausible
-    - segmentation-only reacquisition after loss
+    - track with optical-flow homography while motion is plausible
+    - hide overlay immediately when tracking becomes implausible
+    - discover Sudoku-grid candidates using grid-first discovery, not segmentation alone
+    - allow fast cached reacquisition only when the candidate appears near the last pose
+    - require fresh candidate solve for far/different-pose candidates when enabled
     """
     if not args.input:
         raise ValueError("--input is required for video mode.")
@@ -493,9 +505,11 @@ def run_video_mode(args: argparse.Namespace) -> None:
     last_flow_points = 0
     last_flow_inliers = 0
     last_flow_ratio = 0.0
+
     last_good_area_px = None
-    pending_reacq_corners = None
-    pending_reacq_count = 0
+    last_good_center_px = None
+    pending_candidate_corners = None
+    pending_candidate_count = 0
 
     loss_events = 0
     reacquisition_events = 0
@@ -506,30 +520,37 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
     started = time.perf_counter()
 
+    def remember_good_pose(corners) -> None:
+        nonlocal last_good_area_px, last_good_center_px
+        if corners is None:
+            return
+        last_good_area_px = _quad_area_px(corners)
+        last_good_center_px = _quad_center_px(corners)
+
     def mark_lost(reason: str) -> None:
-        nonlocal solved, flow_ok, last_reason, loss_events, last_good_area_px
-        nonlocal pending_reacq_corners, pending_reacq_count
+        """Hide overlay and preserve last good pose/session for possible same-board reacq."""
+        nonlocal flow_ok, last_reason, loss_events
+        nonlocal pending_candidate_corners, pending_candidate_count
+
+        if session.smoothed_corners is not None:
+            remember_good_pose(session.smoothed_corners)
 
         flow_ok = False
-        solved = False
         last_reason = reason
         flow.reset()
 
-        # Hard reset: old geometry and old solution are now unsafe.
-        # The next visible puzzle must be discovered and solved fresh.
-        session.reset()
+        # Keep givens/solution cached, but do not render stale geometry.
+        session.last_corners = None
+        session.smoothed_corners = None
         session.tracking_quality = 0.0
+        session.status = BoardStatus.TRACKING_LOST
 
-        last_good_area_px = None
-        pending_reacq_corners = None
-        pending_reacq_count = 0
-
+        pending_candidate_corners = None
+        pending_candidate_count = 0
         loss_events += 1
 
     def validate_tracked_corners(corners, previous_corners, frame_shape) -> tuple[bool, str, float]:
-        nonlocal last_good_area_px
-
-        h, w = frame.shape[:2]
+        h, w = frame_shape[:2]
         frame_area = float(h * w)
         max_dim = float(max(h, w))
 
@@ -537,9 +558,10 @@ def run_video_mode(args: argparse.Namespace) -> None:
             return False, "no corners", 0.0
 
         area = _quad_area_px(corners)
+        area_frac = area / frame_area if frame_area > 0 else 0.0
 
-        if area < frame_area * args.video_min_board_area_frac:
-            return False, f"board too small: area_frac={area / frame_area:.4f}", area
+        if area_frac < args.video_min_board_area_frac:
+            return False, f"board too small: area_frac={area_frac:.4f}", area
 
         if last_good_area_px is not None and last_good_area_px > 1:
             ratio = area / last_good_area_px
@@ -553,7 +575,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
         scored = score_corners(
             corners,
-            frame_shape=frame.shape,
+            frame_shape=frame_shape,
             previous_corners=previous_corners,
         )
 
@@ -565,21 +587,16 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
         return True, "ok", area
 
-    def validate_reacq_candidate(corners, frame):
-        """Validate segmentation output during reacquisition.
-
-        This creates the effective "no puzzle detected" path:
-        segmentation may return a best candidate, but we reject it unless
-        it looks like a plausible Sudoku board.
-        """
+    def validate_segmentation_candidate(corners, frame):
+        """Validate a segmentation proposal before treating it as a Sudoku candidate."""
         scored = score_corners(
             corners,
             frame_shape=frame.shape,
-            previous_corners=None,  # do not bias toward old lost position
+            previous_corners=None,
         )
 
         if not scored.detected or scored.corners is None:
-            return False, f"reacq score failed: {scored.reason}", None, 0.0
+            return False, f"seg score failed: {scored.reason}", None
 
         h, w = frame.shape[:2]
         frame_area = float(h * w)
@@ -587,13 +604,13 @@ def run_video_mode(args: argparse.Namespace) -> None:
         area_frac = area / frame_area if frame_area > 0 else 0.0
 
         if area_frac < args.reacquire_min_board_area_frac:
-            return False, f"reacq too small: area_frac={area_frac:.4f}", None, area
+            return False, f"seg too small: area_frac={area_frac:.4f}", None
 
         if area_frac > args.reacquire_max_board_area_frac:
-            return False, f"reacq too large: area_frac={area_frac:.4f}", None, area
+            return False, f"seg too large: area_frac={area_frac:.4f}", None
 
         if scored.quality < args.reacquire_min_score_quality:
-            return False, f"reacq low quality: q={scored.quality:.2f}", None, area
+            return False, f"seg low quality: q={scored.quality:.2f}", None
 
         grid_result = validate_sudoku_grid_candidate(
             frame,
@@ -603,23 +620,13 @@ def run_video_mode(args: argparse.Namespace) -> None:
         )
 
         if not grid_result.ok:
-            return False, f"reacq {grid_result.reason}", None, area
+            return False, grid_result.reason, None
 
-        return (
-            True,
-            f"reacq candidate ok: q={scored.quality:.2f} area={area_frac:.3f}; {grid_result.reason}",
-            scored.corners,
-            area,
-        )
-
+        return True, f"seg candidate ok: q={scored.quality:.2f}; {grid_result.reason}", scored.corners
 
     def initialize_from_fresh_solve(frame, frame_idx: int, label: str) -> bool:
-        """Run a fresh solve and initialize optical flow.
-
-        Used for initial detection and for new-board discovery after implausible motion.
-        """
-        nonlocal solved, flow_ok, last_error, last_reason, last_good_area_px
-        nonlocal pending_reacq_corners, pending_reacq_count, reacquisition_events
+        nonlocal solved, flow_ok, last_error, last_reason
+        nonlocal pending_candidate_corners, pending_candidate_count
 
         ok, last_error = solve_and_update_session(
             frame=frame,
@@ -646,118 +653,248 @@ def run_video_mode(args: argparse.Namespace) -> None:
             session.last_seen_frame_idx = frame_idx
             session.status = BoardStatus.SOLVED_TRACKING
             session.tracking_quality = 1.0
-            last_good_area_px = _quad_area_px(init_result.corners)
-            pending_reacq_corners = None
-            pending_reacq_count = 0
+            remember_good_pose(init_result.corners)
+            pending_candidate_corners = None
+            pending_candidate_count = 0
             last_reason = f"{label}: solved and initialized flow"
             return True
 
         solved = False
         flow_ok = False
         session.reset()
-        pending_reacq_corners = None
-        pending_reacq_count = 0
+        pending_candidate_corners = None
+        pending_candidate_count = 0
         last_reason = f"{label}: flow init failed: {init_result.reason}"
         return False
 
+    def initialize_from_candidate_solve(frame, corners, frame_idx: int, label: str) -> bool:
+        """Solve a discovered candidate crop and attach solution to original-frame corners."""
+        nonlocal solved, flow_ok, last_error, last_reason, reacquisition_events
+        nonlocal pending_candidate_corners, pending_candidate_count
+        nonlocal discovery_solve_attempts, last_discovery_solve_frame
+
+        try:
+            candidate = warp_candidate(frame, corners, size=args.candidate_solve_size)
+
+            pad = int(args.candidate_solve_pad)
+            if pad > 0:
+                candidate = cv2.copyMakeBorder(
+                    candidate,
+                    pad,
+                    pad,
+                    pad,
+                    pad,
+                    cv2.BORDER_CONSTANT,
+                    value=(255, 255, 255),
+                )
+
+            result = solve_frame_with_timeout(candidate, args)
+
+            session.set_solved(
+                givens=result.givens,
+                solution=result.solution,
+                corners=corners,
+                frame_idx=frame_idx,
+                solve_latency_ms=result.solve_latency_ms,
+            )
+
+            init_result = flow.initialize(frame, corners)
+            if init_result.ok and init_result.corners is not None:
+                solved = True
+                flow_ok = True
+                session.smoothed_corners = init_result.corners
+                session.last_corners = init_result.corners
+                session.last_seen_frame_idx = frame_idx
+                session.status = BoardStatus.SOLVED_TRACKING
+                session.tracking_quality = 1.0
+                remember_good_pose(init_result.corners)
+                pending_candidate_corners = None
+                pending_candidate_count = 0
+                reacquisition_events += 1
+                last_reason = f"{label}: candidate solved and flow initialized"
+                return True
+
+            solved = False
+            flow_ok = False
+            session.reset()
+            last_reason = f"{label}: candidate solved but flow init failed: {init_result.reason}"
+            return False
+
+        except Exception as exc:
+            solved = False
+            flow_ok = False
+            last_error = f"{label}: candidate solve failed: {type(exc).__name__}: {exc}"
+            last_reason = last_error
+            return False
+
+    def maybe_reacquire_cached_solution(frame, corners, frame_idx: int, pose_reason: str, fit_reason: str) -> bool:
+        """Fast path for likely same-board reacquisition."""
+        nonlocal solved, flow_ok, last_reason, reacquisition_events
+        nonlocal pending_candidate_corners, pending_candidate_count
+
+        if session.givens is None or session.solution is None:
+            return False
+
+        init_result = flow.initialize(frame, corners)
+        if init_result.ok and init_result.corners is not None:
+            solved = True
+            flow_ok = True
+            session.smoothed_corners = init_result.corners
+            session.last_corners = init_result.corners
+            session.last_seen_frame_idx = frame_idx
+            session.status = BoardStatus.REACQUIRED
+            session.tracking_quality = 1.0
+            remember_good_pose(init_result.corners)
+            pending_candidate_corners = None
+            pending_candidate_count = 0
+            reacquisition_events += 1
+            last_reason = f"same-pose cached reacq: {pose_reason}; {fit_reason}"
+            return True
+
+        flow_ok = False
+        pending_candidate_corners = None
+        pending_candidate_count = 0
+        last_reason = f"same-pose cached reacq failed: {init_result.reason}"
+        return False
 
     def discover_candidate_and_maybe_solve(frame, frame_idx: int) -> None:
-        """Cheap-ish discovery gate before running a fresh solve.
-
-        This prevents repeated full solves on random background frames.
-        """
+        """Find a Sudoku-grid candidate and decide cached reacq vs fresh solve."""
         nonlocal flow_ok, last_reason, last_track_ms
-        nonlocal pending_reacq_corners, pending_reacq_count
+        nonlocal pending_candidate_corners, pending_candidate_count
         nonlocal discovery_solve_attempts, last_discovery_solve_frame
 
         try:
             t0 = time.perf_counter()
-            corners, timing = detect_board_corners_only(
+            grid_candidate = find_sudoku_grid_candidate(
                 frame,
-                repo_root=args.repo_root,
-            )
-            last_track_ms = timing.get(
-                "segmentation_ms",
-                (time.perf_counter() - t0) * 1000.0,
+                min_area_frac=args.reacquire_min_board_area_frac,
             )
 
-            cand_ok, cand_reason, cand_corners, _ = validate_reacq_candidate(
-                corners,
-                frame,
-            )
+            if grid_candidate.ok and grid_candidate.corners is not None:
+                last_track_ms = (time.perf_counter() - t0) * 1000.0
+                cand_ok = True
+                cand_reason = grid_candidate.reason
+                cand_corners = grid_candidate.corners
+            else:
+                corners, timing = detect_board_corners_only(
+                    frame,
+                    repo_root=args.repo_root,
+                )
+                last_track_ms = timing.get(
+                    "segmentation_ms",
+                    (time.perf_counter() - t0) * 1000.0,
+                )
+                cand_ok, cand_reason, cand_corners = validate_segmentation_candidate(corners, frame)
 
             if not cand_ok or cand_corners is None:
-                pending_reacq_corners = None
-                pending_reacq_count = 0
+                pending_candidate_corners = None
+                pending_candidate_count = 0
                 flow_ok = False
                 last_reason = f"discover rejected: {cand_reason}"
                 return
 
-            if pending_reacq_corners is None:
-                pending_reacq_corners = cand_corners.copy()
-                pending_reacq_count = 1
+            if pending_candidate_corners is None:
+                pending_candidate_corners = cand_corners.copy()
+                pending_candidate_count = 1
                 flow_ok = False
                 last_reason = (
-                    f"discover pending {pending_reacq_count}/"
+                    f"discover pending {pending_candidate_count}/"
                     f"{args.discover_confirm_frames}: {cand_reason}"
                 )
                 return
 
-            shift = _mean_corner_jump_px(cand_corners, pending_reacq_corners)
+            shift = _mean_corner_jump_px(cand_corners, pending_candidate_corners)
             max_dim = float(max(frame.shape[:2]))
-
             if shift > max_dim * args.reacquire_max_candidate_shift_frac:
-                pending_reacq_corners = cand_corners.copy()
-                pending_reacq_count = 1
+                pending_candidate_corners = cand_corners.copy()
+                pending_candidate_count = 1
                 flow_ok = False
                 last_reason = f"discover candidate moved/reset: shift={shift:.1f}px"
                 return
 
-            pending_reacq_corners = cand_corners.copy()
-            pending_reacq_count += 1
+            pending_candidate_corners = cand_corners.copy()
+            pending_candidate_count += 1
             last_reason = (
-                f"discover pending {pending_reacq_count}/"
+                f"discover pending {pending_candidate_count}/"
                 f"{args.discover_confirm_frames}: shift={shift:.1f}px"
             )
 
-            if pending_reacq_count >= args.discover_confirm_frames:
-                if args.enable_discovery_solve:
-                    frames_since_attempt = frame_idx - last_discovery_solve_frame
+            if pending_candidate_count < args.discover_confirm_frames:
+                return
 
-                    if discovery_solve_attempts >= args.discover_max_solve_attempts:
-                        flow_ok = False
-                        last_reason = (
-                            "discover confirmed candidate, but max fresh-solve "
-                            f"attempts reached: {discovery_solve_attempts}"
-                        )
-                    elif frames_since_attempt < args.discover_solve_cooldown_frames:
-                        flow_ok = False
-                        last_reason = (
-                            "discover confirmed candidate, but solve cooldown active: "
-                            f"{frames_since_attempt}/{args.discover_solve_cooldown_frames} frames"
-                        )
-                    else:
-                        discovery_solve_attempts += 1
-                        last_discovery_solve_frame = frame_idx
-                        initialize_from_fresh_solve(
-                            frame=frame,
-                            frame_idx=frame_idx,
-                            label="fresh discovery",
-                        )
-                else:
-                    flow_ok = False
-                    last_reason = (
-                        "discover confirmed candidate, but fresh solve disabled "
-                        "(use --enable-discovery-solve to allow it)"
-                    )
+            fit = evaluate_sudoku_grid_fit(
+                frame,
+                pending_candidate_corners,
+                max_mean_error_px=args.fit_max_mean_error_px,
+                min_found_lines=args.fit_min_found_lines,
+            )
+            if not fit.ok:
+                flow_ok = False
+                pending_candidate_corners = None
+                pending_candidate_count = 0
+                last_reason = f"discover rejected: {fit.reason}"
+                return
+
+            same_pose_likely = False
+            pose_reason = "no last pose"
+            if last_good_center_px is not None and last_good_area_px is not None and last_good_area_px > 1:
+                cand_center = _quad_center_px(pending_candidate_corners)
+                cand_area = _quad_area_px(pending_candidate_corners)
+                frame_diag = float((frame.shape[0] ** 2 + frame.shape[1] ** 2) ** 0.5)
+                center_frac = float(np.linalg.norm(cand_center - last_good_center_px) / max(frame_diag, 1.0))
+                area_ratio = cand_area / last_good_area_px
+                same_pose_likely = (
+                    center_frac <= args.same_pose_center_frac
+                    and args.same_pose_min_area_ratio <= area_ratio <= args.same_pose_max_area_ratio
+                )
+                pose_reason = f"center_frac={center_frac:.2f} area_ratio={area_ratio:.2f}"
+
+            if same_pose_likely and maybe_reacquire_cached_solution(
+                frame,
+                pending_candidate_corners,
+                frame_idx,
+                pose_reason,
+                fit.reason,
+            ):
+                return
+
+            # Different/far pose: require fresh candidate solve before showing an overlay.
+            if not args.enable_discovery_solve:
+                flow_ok = False
+                last_reason = f"new/different pose candidate; fresh solve disabled: {pose_reason}; {fit.reason}"
+                return
+
+            frames_since_attempt = frame_idx - last_discovery_solve_frame
+            if discovery_solve_attempts >= args.discover_max_solve_attempts:
+                flow_ok = False
+                last_reason = (
+                    "discover confirmed candidate, but max fresh-solve attempts reached: "
+                    f"{discovery_solve_attempts}"
+                )
+                return
+
+            if frames_since_attempt < args.discover_solve_cooldown_frames:
+                flow_ok = False
+                last_reason = (
+                    "discover confirmed candidate, but solve cooldown active: "
+                    f"{frames_since_attempt}/{args.discover_solve_cooldown_frames} frames"
+                )
+                return
+
+            discovery_solve_attempts += 1
+            last_discovery_solve_frame = frame_idx
+            initialize_from_candidate_solve(
+                frame=frame,
+                corners=pending_candidate_corners,
+                frame_idx=frame_idx,
+                label="fresh grid discovery",
+            )
 
         except Exception as exc:
-            pending_reacq_corners = None
-            pending_reacq_count = 0
+            pending_candidate_corners = None
+            pending_candidate_count = 0
             flow_ok = False
             last_reason = f"discover failed: {type(exc).__name__}: {exc}"
-
-
 
     print(f"Reading video: {args.input}")
     print(f"Writing video: {out_path}")
@@ -780,22 +917,16 @@ def run_video_mode(args: argparse.Namespace) -> None:
             if not writer.isOpened():
                 raise RuntimeError(f"Could not open video writer: {out_path}")
 
-        # Initial solve and subsequent fresh discovery.
         if frame_idx == args.solve_frame and not solved:
-            initialize_from_fresh_solve(
-                frame=frame,
-                frame_idx=frame_idx,
-                label="initial solve",
-            )
+            initialize_from_fresh_solve(frame=frame, frame_idx=frame_idx, label="initial solve")
 
         elif (
-            not solved
+            (not solved or session.status == BoardStatus.TRACKING_LOST)
             and frame_idx > args.solve_frame
             and frame_idx % max(args.discover_every_n_frames, 1) == 0
         ):
             discover_candidate_and_maybe_solve(frame, frame_idx)
 
-        # Fast per-frame optical-flow tracking while board is visible.
         elif solved and flow.initialized and session.status != BoardStatus.TRACKING_LOST:
             previous_corners = None if session.smoothed_corners is None else session.smoothed_corners.copy()
 
@@ -821,7 +952,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
                     session.last_seen_frame_idx = frame_idx
                     session.tracking_quality = max(0.0, min(1.0, flow_result.inlier_ratio))
                     session.status = BoardStatus.SOLVED_TRACKING
-                    last_good_area_px = area
+                    remember_good_pose(flow_result.corners)
                     last_reason = flow_result.reason
                     tracking_frames += 1
                 else:
@@ -830,147 +961,6 @@ def run_video_mode(args: argparse.Namespace) -> None:
             else:
                 mark_lost(f"flow failed: {flow_result.reason}")
                 lost_frames += 1
-
-        # Segmentation-only reacquisition after tracking is lost.
-        # Important: segmentation candidates are treated as "proposals" only.
-        # We require repeated consistent proposals before reattaching the cached overlay.
-        should_reacquire = (
-            solved
-            and session.status == BoardStatus.TRACKING_LOST
-            and frame_idx % max(args.reacquire_every_n_frames, 1) == 0
-        )
-
-        if should_reacquire and args.reacquire_with_solve:
-            try:
-                print(f"Reacquisition solve attempt at frame {frame_idx}...")
-                result = solve_frame(
-                    frame,
-                    solver=args.solver,
-                    repo_root=args.repo_root,
-                )
-
-                givens_count = count_givens(result.givens)
-                if not (args.reacquire_min_givens <= givens_count <= args.reacquire_max_givens):
-                    flow_ok = False
-                    last_reason = (
-                        f"reacq solve rejected: givens_count={givens_count} "
-                        f"allowed=[{args.reacquire_min_givens},{args.reacquire_max_givens}]"
-                    )
-                else:
-                    session.set_solved(
-                        givens=result.givens,
-                        solution=result.solution,
-                        corners=result.corners,
-                        frame_idx=frame_idx,
-                        solve_latency_ms=result.solve_latency_ms,
-                    )
-
-                    init_result = flow.initialize(frame, result.corners)
-                    if init_result.ok and init_result.corners is not None:
-                        flow_ok = True
-                        session.smoothed_corners = init_result.corners
-                        session.last_corners = init_result.corners
-                        session.last_seen_frame_idx = frame_idx
-                        session.tracking_quality = 1.0
-                        session.status = BoardStatus.REACQUIRED
-                        last_good_area_px = _quad_area_px(init_result.corners)
-                        reacquisition_events += 1
-                        pending_reacq_corners = None
-                        pending_reacq_count = 0
-                        last_reason = (
-                            f"reacquired via fresh solve: givens={givens_count} "
-                            f"{init_result.reason}"
-                        )
-                    else:
-                        flow_ok = False
-                        session.status = BoardStatus.TRACKING_LOST
-                        session.last_corners = None
-                        session.smoothed_corners = None
-                        last_reason = f"reacq solve ok but flow init failed: {init_result.reason}"
-
-            except Exception as exc:
-                flow_ok = False
-                session.status = BoardStatus.TRACKING_LOST
-                session.last_corners = None
-                session.smoothed_corners = None
-                last_reason = f"reacq solve failed: {type(exc).__name__}: {exc}"
-
-            should_reacquire = False
-
-        if should_reacquire:
-            try:
-                t0 = time.perf_counter()
-                corners, timing = detect_board_corners_only(
-                    frame,
-                    repo_root=args.repo_root,
-                )
-                last_track_ms = timing.get(
-                    "segmentation_ms",
-                    (time.perf_counter() - t0) * 1000.0,
-                )
-
-                cand_ok, cand_reason, cand_corners, cand_area = validate_reacq_candidate(
-                    corners,
-                    frame.shape,
-                )
-
-                if not cand_ok or cand_corners is None:
-                    pending_reacq_corners = None
-                    pending_reacq_count = 0
-                    flow_ok = False
-                    last_reason = cand_reason
-                else:
-                    if pending_reacq_corners is None:
-                        pending_reacq_corners = cand_corners.copy()
-                        pending_reacq_count = 1
-                        flow_ok = False
-                        last_reason = (
-                            f"reacq pending {pending_reacq_count}/"
-                            f"{args.reacquire_confirm_frames}: {cand_reason}"
-                        )
-                    else:
-                        shift = _mean_corner_jump_px(cand_corners, pending_reacq_corners)
-                        max_dim = float(max(frame.shape[:2]))
-
-                        if shift <= max_dim * args.reacquire_max_candidate_shift_frac:
-                            pending_reacq_corners = cand_corners.copy()
-                            pending_reacq_count += 1
-                            last_reason = (
-                                f"reacq pending {pending_reacq_count}/"
-                                f"{args.reacquire_confirm_frames}: shift={shift:.1f}px"
-                            )
-                        else:
-                            pending_reacq_corners = cand_corners.copy()
-                            pending_reacq_count = 1
-                            flow_ok = False
-                            last_reason = f"reacq candidate moved/reset: shift={shift:.1f}px"
-
-                    if pending_reacq_count >= args.reacquire_confirm_frames:
-                        init_result = flow.initialize(frame, pending_reacq_corners)
-
-                        if init_result.ok and init_result.corners is not None:
-                            flow_ok = True
-                            session.smoothed_corners = init_result.corners
-                            session.last_corners = init_result.corners
-                            session.last_seen_frame_idx = frame_idx
-                            session.tracking_quality = 1.0
-                            session.status = BoardStatus.REACQUIRED
-                            last_good_area_px = _quad_area_px(init_result.corners)
-                            pending_reacq_corners = None
-                            pending_reacq_count = 0
-                            reacquisition_events += 1
-                            last_reason = f"reacquired: {init_result.reason}"
-                        else:
-                            flow_ok = False
-                            pending_reacq_corners = None
-                            pending_reacq_count = 0
-                            last_reason = f"reacq flow init failed: {init_result.reason}"
-
-            except Exception as exc:
-                flow_ok = False
-                pending_reacq_corners = None
-                pending_reacq_count = 0
-                last_reason = f"reacq failed: {type(exc).__name__}: {exc}"
 
         display = frame.copy()
 
@@ -1020,7 +1010,6 @@ def run_video_mode(args: argparse.Namespace) -> None:
             draw_text_lines(display, lines)
 
         writer.write(display)
-
         frame_idx += 1
         processed_frames += 1
 
@@ -1151,6 +1140,23 @@ def parse_args() -> argparse.Namespace:
         default=2.5,
         help="Max seconds allowed for each solve attempt. Use 0 to disable timeout.",
     )
+    parser.add_argument(
+        "--candidate-solve-size",
+        type=int,
+        default=900,
+        help="Canonical warp size used when solving a discovered grid candidate.",
+    )
+    parser.add_argument(
+        "--candidate-solve-pad",
+        type=int,
+        default=80,
+        help="White padding around discovered grid candidate before solving.",
+    )
+    parser.add_argument("--same-pose-center-frac", type=float, default=0.35)
+    parser.add_argument("--same-pose-min-area-ratio", type=float, default=0.45)
+    parser.add_argument("--same-pose-max-area-ratio", type=float, default=2.25)
+    parser.add_argument("--fit-max-mean-error-px", type=float, default=14.0)
+    parser.add_argument("--fit-min-found-lines", type=int, default=7)
     parser.add_argument(
         "--discover-solve-cooldown-frames",
         type=int,
