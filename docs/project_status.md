@@ -3062,3 +3062,620 @@ Otherwise:
 
 > Freeze this as the core demo and move to README / metrics / video polish.
 
+
+# `sudoku-ar-overlay` Status Update — Known-Board Identity Caching / Core Demo Freeze Candidate
+
+**Date:** 2026-04-24  
+**Recommended section:** Append as `## 23` in `docs/project_status.md`  
+**Current branch:** `markerless-video-demo`  
+**Purpose:** Preserve the current working state after adding known-board identity caching and deciding the core demo is ready to freeze/package rather than keep chasing deeper AR/SLAM behavior.
+
+---
+
+## 23. Update — Known-Board Identity Caching Added; Core Markerless Video Demo Is Ready to Package
+
+### 23.1 Executive summary
+
+The project has reached a strong core-demo checkpoint.
+
+The latest implementation adds **known-board identity caching**, allowing the app to distinguish a previously solved Sudoku board from a new/different board candidate during reacquisition. This matters because the system should **reuse the clean original solution for a known board** instead of re-running OCR/Sudoku solve on later degraded frames.
+
+Current best demo behavior:
+
+```text
+clean initial frame
+→ real solver solves puzzle once
+→ solved board is registered as a known board
+→ optical-flow homography tracks the overlay while visible
+→ overlay hides when tracking becomes implausible
+→ discovery/reacquisition searches for returning board
+→ known-board identity check can reattach cached solution
+→ app avoids blindly re-solving the known board from worse later frames
+```
+
+This is now a legitimate MLE/perception portfolio demo.
+
+The project should move from core algorithm work into **packaging, README polish, metrics documentation, and final demo asset creation**.
+
+---
+
+### 23.2 Current repo status and important commit
+
+The known-board identity work was committed successfully:
+
+```text
+ddb0c8e Add known-board identity caching for safer reacquisition
+```
+
+This commit added/updated:
+
+```text
+app.py
+src/sudoku_ar_overlay/board_identity.py
+```
+
+The terminal confirmed:
+
+```text
+[markerless-video-demo ddb0c8e] Add known-board identity caching for safer reacquisition
+ 2 files changed, 298 insertions(+), 1 deletion(-)
+ create mode 100644 src/sudoku_ar_overlay/board_identity.py
+```
+
+This is now the key current implementation checkpoint.
+
+---
+
+### 23.3 Latest successful known-board identity run
+
+Command context:
+
+```text
+input:  assets/demo/raw_iphone_aggressive_1080p30.mp4
+output: assets/demo/processed_iphone_aggressive_known_board_identity.mp4
+```
+
+The latest run completed end-to-end.
+
+Terminal output:
+
+```text
+Reading video: assets/demo/raw_iphone_aggressive_1080p30.mp4
+Writing video: assets/demo/processed_iphone_aggressive_known_board_identity.mp4
+Input FPS: 30.00
+Total frames: 1568
+Solve frame: 10
+
+Solving frame 10 with solver=real...
+Solved frame 10
+Solver status: real_solved
+Solve latency: 306.70 ms
+Latency breakdown:
+  segmentation_ms: 269.77 ms
+  warp_crop_ms: 1.81 ms
+  ocr_ms: 33.08 ms
+  sudoku_solve_ms: 2.04 ms
+  pipeline_ms: 306.70 ms
+
+Registered known board id=1 label=initial solve
+
+Wrote output video: assets/demo/processed_iphone_aggressive_known_board_identity.mp4
+Processed frames: 1568
+Wall time: 98.89 sec
+Processing FPS: 15.86
+Final state: SOLVED_TRACKING
+Solve latency ms: 306.70
+Tracking uptime: 0.706
+Tracking loss events: 3
+Reacquisition events: 3
+```
+
+Important numbers to preserve:
+
+| Metric | Value |
+|---|---:|
+| Input FPS | 30.00 |
+| Total frames | 1568 |
+| Solve frame | 10 |
+| Initial solve latency | 306.70 ms |
+| Segmentation latency | 269.77 ms |
+| OCR latency | 33.08 ms |
+| Sudoku solve latency | 2.04 ms |
+| Processing FPS | 15.86 |
+| Tracking uptime | 0.706 |
+| Tracking loss events | 3 |
+| Reacquisition events | 3 |
+| Final state | `SOLVED_TRACKING` |
+
+Interpretation:
+
+> The system processed the aggressive recorded-video test fully, solved the first puzzle, registered it as a known board, recovered from multiple loss/reacquisition events, and ended in a solved-tracking state.
+
+---
+
+### 23.4 What known-board identity caching fixed
+
+Before this change, the system had a risky behavior:
+
+```text
+known puzzle returns late in video
+→ app may treat it as a generic/new candidate
+→ app may fresh-solve from a worse motion-blurred/angled frame
+→ OCR can produce wrong givens
+→ solver returns a valid but wrong solution
+→ overlay appears confidently wrong
+```
+
+The known-board identity path addresses this by changing the rule:
+
+```text
+if candidate visually matches a known solved board:
+  reuse cached givens/solution
+  initialize overlay/tracker from current refined corners
+  do not re-run OCR/Sudoku solve for that known board
+```
+
+This is the correct product behavior.
+
+A known board should not be re-solved from a worse frame when a cleaner solution already exists in session memory.
+
+---
+
+### 23.5 New module: `board_identity.py`
+
+New file:
+
+```text
+src/sudoku_ar_overlay/board_identity.py
+```
+
+Role:
+
+```text
+create visual fingerprint/template for a solved board
+compare reacquired candidates against known board fingerprints
+decide whether a candidate is likely the same known board
+support fast/safe cached reacquisition
+```
+
+Conceptual behavior:
+
+```text
+initial solve:
+  warp board to canonical view
+  create normalized fingerprint/template
+  store known board record with givens/solution
+
+candidate during reacquisition:
+  warp candidate to canonical view
+  compute similarity to known board fingerprints
+  if score exceeds threshold:
+    treat as known board
+    reuse cached solution
+  otherwise:
+    treat as unknown/new puzzle candidate
+```
+
+Current known-board parameters used in the latest run:
+
+```text
+--known-board-match-threshold 0.78
+--known-board-fingerprint-size 450
+```
+
+Tuning guidance:
+
+```text
+if known board is not recognized:
+  lower threshold slightly, e.g. 0.74
+
+if a new/different board is incorrectly treated as known:
+  raise threshold, e.g. 0.84
+```
+
+---
+
+### 23.6 Current best architecture after known-board identity
+
+The current architecture is now:
+
+```text
+Initial solve:
+  real frozen sudoku-image-solver pipeline
+  segmentation + OCR + Sudoku solve
+  cache givens/solution/missing cells
+  register known-board fingerprint
+
+Visible tracking:
+  optical flow tracks board features
+  RANSAC homography updates board corners
+  overlay renders by warping solved digits onto the current board plane
+
+Tracking failure:
+  motion/geometry gates reject implausible flow
+  overlay hides immediately
+  session retains known board state
+
+Reacquisition:
+  grid-first discovery and/or segmentation fallback finds candidates
+  candidates are grid-validated
+  corners are refined against Sudoku grid lines
+  stability buffer waits for stable geometry
+  known-board matcher checks whether this candidate is already solved
+  if known: reuse cached solution
+  if unknown: require fresh solve path
+```
+
+This is a clean and defensible perception-system design.
+
+---
+
+### 23.7 Current tracking method clarification
+
+The project is **not** using visual odometry.
+
+Current tracking method:
+
+```text
+optical flow + homography
+```
+
+More specifically:
+
+```text
+board solved / detected once
+→ select image features on/near the board
+→ track 2D feature movement frame-to-frame using optical flow
+→ estimate homography with RANSAC
+→ project Sudoku board corners through the homography
+→ render the solved digit overlay onto the updated board plane
+```
+
+This is:
+
+```text
+2D planar object tracking
+```
+
+not:
+
+```text
+3D camera/world motion estimation
+visual odometry
+SLAM
+VIO
+ARKit/ARCore world anchoring
+```
+
+Correct README phrasing:
+
+> Homography-based planar tracking using optical flow, not visual odometry or SLAM.
+
+This is technically honest and appropriate because Sudoku is a flat planar target.
+
+---
+
+### 23.8 Why this is good enough for an MLE portfolio demo
+
+This project now demonstrates the right skills for a hands-on MLE/applied perception portfolio artifact:
+
+```text
+reuse a frozen ML/CV model in a new application
+build an inference adapter around another repo
+wrap static inference in a video perception system
+separate solve, track, reacquire, and render responsibilities
+use confidence gates and fail-closed behavior
+debug real video failure modes
+add grid validation and corner refinement
+use optical flow/homography for planar tracking
+add known-object identity caching
+measure latency, tracking uptime, loss events, and reacquisition events
+document limitations honestly
+```
+
+This is much stronger than a basic static overlay.
+
+The project does **not** need to become a full 3D AR/SLAM app to be portfolio-worthy.
+
+Recommended framing:
+
+> A markerless recorded-video planar AR overlay that turns a frozen Sudoku image solver into a video perception system with solve-once inference, optical-flow homography tracking, fail-closed confidence gates, stable grid reacquisition, and known-board identity caching.
+
+---
+
+### 23.9 Current recommendation: freeze core algorithm work
+
+Recommendation:
+
+```text
+ship/freeze the core demo implementation
+stop chasing additional tracking/reacquisition improvements for now
+move to packaging
+```
+
+Reason:
+
+The remaining improvements are now incremental and time-expensive:
+
+```text
+multi-frame solve consensus
+better new-puzzle acquisition
+more robust OCR voting
+pose/entry-side identity scoring
+cleaner configuration management
+```
+
+These are valuable, but they are not necessary for the main portfolio signal.
+
+The main demo story is already strong.
+
+---
+
+### 23.10 Hero demo vs stress-test demo decision
+
+Do **not** use the most aggressive multi-puzzle stress clip as the primary hero demo if it has any visibly wrong solution.
+
+Recommended split:
+
+```text
+Hero demo:
+  one puzzle
+  clean initial solve
+  moderate movement
+  look away / board leaves frame
+  board returns
+  cached overlay reacquires correctly
+  no wrong solution
+
+Stress-test/debug demo:
+  aggressive movement
+  second/different puzzle
+  debug overlay text
+  shows limitations and failure-safe behavior
+```
+
+Why:
+
+```text
+A wrong confident overlay is worse than a delayed/missed overlay.
+The hero video should be clean, reliable, and short.
+The aggressive video is better as engineering evidence / limitations discussion.
+```
+
+This is the professional product/portfolio choice.
+
+---
+
+### 23.11 Current known limitations to document
+
+Current limitations should be stated honestly:
+
+```text
+This is planar AR-style tracking, not full 3D AR.
+No persistent world anchoring when the board is fully out of view.
+Aggressive fast motion can delay or break reacquisition.
+New/different puzzle acquisition is harder than known-board reacquisition.
+A single bad OCR frame can still produce a wrong but valid Sudoku solution.
+Multi-frame solve agreement is future work.
+Live webcam mode is secondary/experimental.
+Recorded iPhone video is the primary polished demo path.
+```
+
+The key limitation:
+
+> New-puzzle acquisition still needs multi-frame solve confirmation before it is safe under aggressive motion.
+
+Recommended future work:
+
+```text
+multi-frame OCR/solve agreement
+best-candidate solve ranking
+known/new board identity scoring using both visual template and givens pattern
+pose/entry-side scoring
+cleaner config profiles for hero/stress modes
+optional mobile ARKit/ARCore implementation
+```
+
+---
+
+### 23.12 Current best command/profile to preserve
+
+The latest known-board identity run used this profile:
+
+```bash
+PYTHONPATH=src python app.py \
+  --mode video \
+  --solver real \
+  --repo-root "$HOME/projects/sudoku-image-solver" \
+  --input assets/demo/raw_iphone_aggressive_1080p30.mp4 \
+  --out assets/demo/processed_iphone_aggressive_known_board_identity.mp4 \
+  --solve-frame 10 \
+  --flow-max-corners 600 \
+  --flow-min-points 30 \
+  --flow-min-inlier-ratio 0.60 \
+  --flow-ransac-reproj-threshold 4.0 \
+  --flow-refresh-points-every 5 \
+  --discover-every-n-frames 2 \
+  --enable-discovery-solve \
+  --solve-timeout-sec 6 \
+  --discover-solve-cooldown-frames 20 \
+  --discover-max-solve-attempts 20 \
+  --reacquire-min-board-area-frac 0.020 \
+  --reacquire-max-candidate-shift-frac 0.25 \
+  --grid-min-peak 0.015 \
+  --grid-min-strong-lines 5 \
+  --video-min-area-change-ratio 0.65 \
+  --video-max-area-change-ratio 1.60 \
+  --video-max-corner-jump-frac 0.20 \
+  --same-pose-center-frac 0.35 \
+  --same-pose-min-area-ratio 0.45 \
+  --same-pose-max-area-ratio 2.25 \
+  --fit-max-mean-error-px 12 \
+  --fit-min-found-lines 8 \
+  --refine-max-mean-error-px 14 \
+  --refine-min-found-lines 8 \
+  --reacq-stable-min-frames 8 \
+  --reacq-stable-max-center-motion-frac 0.025 \
+  --reacq-stable-max-area-ratio 1.15 \
+  --reacq-stable-max-corner-motion-frac 0.030 \
+  --known-board-match-threshold 0.78 \
+  --known-board-fingerprint-size 450 \
+  --debug
+```
+
+Recommended action:
+
+Save this as:
+
+```text
+scripts/demo_runs/run_aggressive_known_board_identity.sh
+```
+
+and commit it.
+
+---
+
+### 23.13 Immediate cleanup commands
+
+Remove local backup file:
+
+```bash
+cd "$HOME/Desktop/sudoku-ar-overlay"
+source .venv/bin/activate
+
+rm -f app.py.before_known_board_identity
+```
+
+Check state:
+
+```bash
+git status --short
+git log --oneline -8
+```
+
+Expected remaining untracked item:
+
+```text
+?? assets/
+```
+
+That is okay.
+
+Do not commit large generated video/image assets unless intentionally selecting a final small demo artifact.
+
+---
+
+### 23.14 Recommended next packaging steps
+
+Next work should be packaging, not core algorithm work.
+
+Suggested order:
+
+1. Save current best run command as a script.
+
+```bash
+mkdir -p scripts/demo_runs
+# create scripts/demo_runs/run_aggressive_known_board_identity.sh
+git add scripts/demo_runs/run_aggressive_known_board_identity.sh
+git commit -m "Save known-board aggressive demo run configuration"
+```
+
+2. Add/update docs:
+
+```text
+docs/metrics.md
+README.md
+docs/ROADMAP_CONTRACT.md if needed
+docs/project_status.md
+```
+
+3. Create final demo assets:
+
+```text
+assets/demo/final_hero_demo.mp4      # likely not committed if too large
+assets/demo/final_debug_demo.mp4     # likely not committed if too large
+docs/images/demo_frame.jpg           # small screenshot likely okay
+```
+
+4. Update README with:
+
+```text
+project overview
+architecture diagram
+demo video/GIF or screenshot
+quickstart commands
+pipeline explanation
+metrics table
+known limitations
+future work
+```
+
+5. Decide whether to push branch or merge to main.
+
+---
+
+### 23.15 Suggested README positioning
+
+Recommended README headline:
+
+> Markerless planar AR Sudoku overlay from recorded video.
+
+Recommended summary:
+
+> This project extends a frozen Sudoku image solver into a markerless recorded-video AR-style overlay system. It solves a clean frame once, tracks the puzzle using optical-flow homography, renders missing digits onto the board plane, hides overlays when confidence drops, and reacquires known boards using grid validation, corner refinement, stability gating, and visual identity caching.
+
+Recommended architecture bullets:
+
+```text
+Frozen ML solver integration
+Solve-once session state
+Optical-flow homography tracking
+Fail-closed confidence gates
+Grid-first and segmentation fallback discovery
+Grid-corner refinement
+Candidate stability buffer
+Known-board identity caching
+Recorded MP4 processing
+```
+
+Recommended limitation wording:
+
+> This is not full SLAM, visual odometry, or ARKit-style world anchoring. It is a planar AR-style overlay for a flat target. That is intentional: a Sudoku board is planar, so homography tracking is the appropriate bounded geometry.
+
+---
+
+### 23.16 Current project interpretation
+
+The project has reached the intended portfolio signal.
+
+It now shows:
+
+```text
+ML model reuse
+video inference engineering
+tracking and geometry
+confidence gating
+debugging real-world failure modes
+safe reacquisition policy
+known-object identity caching
+practical scope control
+```
+
+The correct next move is:
+
+```text
+freeze core implementation
+polish README/docs
+create final hero video
+add metrics
+push repo
+move to the next portfolio project
+```
+
+Do not let this turn into an open-ended AR research project.
+
+The project is now good enough to present as:
+
+> A bounded but credible markerless video perception system built around a frozen Sudoku solver, using optical-flow planar tracking and identity-aware reacquisition.
+
+
