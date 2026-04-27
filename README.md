@@ -18,7 +18,7 @@ This project extends [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudok
 **Debug / stress demo:**  
 [Watch `processed_iphone_aggressive_known_board_identity.mp4`](https://github.com/Aaron-Hale/sudoku-ar-overlay/releases/download/markerless-video-demo-v1/processed_iphone_aggressive_known_board_identity.mp4)
 
-The MP4 demo videos are generated artifacts and are intentionally ignored by Git. The small GIF preview above is committed for quick README viewing; the full MP4s are published through the GitHub Release.
+The demo videos are generated artifacts and are intentionally ignored by Git. The small GIF preview above is committed for quick README viewing; full MP4s are published through the GitHub Release.
 
 ---
 
