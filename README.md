@@ -372,6 +372,7 @@ Possible next improvements:
 - Best-candidate solve ranking across a candidate cluster
 - Stronger board identity model
 - Lightweight template matching for faster known-board reacquisition
+- Cleaner demo GIF generation
 - More formal evaluation across multiple videos
 - Optional mobile/native AR implementation
 - Optional ARKit/ARCore prototype
