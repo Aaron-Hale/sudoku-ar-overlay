@@ -8,6 +8,7 @@ import cv2
 
 from sudoku_ar_overlay.board_state import BoardSession, BoardStatus
 from sudoku_ar_overlay.config import OverlayConfig, TrackingConfig
+from sudoku_ar_overlay.flow_tracker import FlowHomographyTracker
 from sudoku_ar_overlay.overlay import draw_board_outline, render_solution_overlay
 from sudoku_ar_overlay.smoothing import smooth_corners
 from sudoku_ar_overlay.solver_adapter import (
@@ -390,16 +391,16 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
 
 
 
+
 def run_video_mode(args: argparse.Namespace) -> None:
     """Process a recorded video and write an annotated output video.
 
-    First implementation:
-    - read frames from --input
-    - solve once at --solve-frame
-    - optionally run segmentation-only tracking every N frames
-    - render cached solution when tracking is confident
-    - hide overlay when tracking is lost
-    - write output MP4
+    This version uses:
+    - solve once on --solve-frame
+    - initialize optical-flow homography tracker from solved corners
+    - update board corners every frame with optical flow
+    - hide overlay when flow confidence fails
+    - use segmentation only for reacquisition after tracking loss
     """
     if not args.input:
         raise ValueError("--input is required for video mode.")
@@ -427,30 +428,31 @@ def run_video_mode(args: argparse.Namespace) -> None:
         detection_every_n_frames=args.track_every_n_frames,
     )
 
-    stabilizer = CornerStabilizer(
-        median_window=args.stabilizer_median_window,
-        min_quality=args.stabilizer_min_quality,
-        static_alpha=args.stabilizer_static_alpha,
-        moving_alpha=args.stabilizer_moving_alpha,
-        static_motion_px=args.stabilizer_static_motion_px,
-        fast_motion_px=args.stabilizer_fast_motion_px,
-        max_jump_ratio=args.stabilizer_max_jump_ratio,
+    flow = FlowHomographyTracker(
+        max_corners=getattr(args, "flow_max_corners", 600),
+        min_points=getattr(args, "flow_min_points", 18),
+        min_inlier_ratio=getattr(args, "flow_min_inlier_ratio", 0.45),
+        ransac_reproj_threshold=getattr(args, "flow_ransac_reproj_threshold", 4.0),
+        refresh_points_every=getattr(args, "flow_refresh_points_every", 5),
     )
 
     writer = None
     frame_idx = 0
     processed_frames = 0
-    tracking_attempts_since_seen = 0
 
+    solved = False
+    flow_ok = False
     last_error = ""
-    last_track_reason = ""
+    last_reason = ""
     last_track_ms = 0.0
-    last_stabilizer_alpha = 0.0
-    last_mean_motion_px = 0.0
+    last_flow_points = 0
+    last_flow_inliers = 0
+    last_flow_ratio = 0.0
 
     loss_events = 0
     reacquisition_events = 0
-    solved = False
+    tracking_frames = 0
+    lost_frames = 0
 
     started = time.perf_counter()
 
@@ -477,7 +479,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
         previous_status = session.status
 
-        # Solve once on the requested frame.
+        # Solve once on the requested frame and initialize optical-flow tracking.
         if frame_idx == args.solve_frame and not solved:
             solved, last_error = solve_and_update_session(
                 frame=frame,
@@ -487,39 +489,91 @@ def run_video_mode(args: argparse.Namespace) -> None:
                 tracking_cfg=tracking_cfg,
             )
 
-        # Optional segmentation-only tracking/reacquisition.
-        should_track_this_frame = (
-            args.track_board
-            and frame_idx % max(args.track_every_n_frames, 1) == 0
+            if solved and session.smoothed_corners is not None:
+                init_result = flow.initialize(frame, session.smoothed_corners)
+                flow_ok = bool(init_result.ok)
+
+                if init_result.ok and init_result.corners is not None:
+                    session.smoothed_corners = init_result.corners
+                    session.last_corners = init_result.corners
+                    session.last_seen_frame_idx = frame_idx
+                    session.status = BoardStatus.SOLVED_TRACKING
+                    session.tracking_quality = 1.0
+                else:
+                    session.status = BoardStatus.TRACKING_LOST
+                    last_reason = f"flow init failed: {init_result.reason}"
+
+        # Fast optical-flow tracking after solve.
+        elif solved and flow.initialized:
+            t0 = time.perf_counter()
+            flow_result = flow.update(frame)
+            last_track_ms = (time.perf_counter() - t0) * 1000.0
+
+            last_reason = flow_result.reason
+            last_flow_points = flow_result.num_points
+            last_flow_inliers = flow_result.num_inliers
+            last_flow_ratio = flow_result.inlier_ratio
+
+            if flow_result.ok and flow_result.corners is not None:
+                flow_ok = True
+                session.smoothed_corners = flow_result.corners
+                session.last_corners = flow_result.corners
+                session.last_seen_frame_idx = frame_idx
+                session.tracking_quality = max(0.0, min(1.0, flow_result.inlier_ratio))
+                session.status = BoardStatus.SOLVED_TRACKING
+                tracking_frames += 1
+            else:
+                flow_ok = False
+                flow.reset()
+                session.status = BoardStatus.TRACKING_LOST
+                lost_frames += 1
+
+        # Reacquire with slow segmentation only after tracking is lost.
+        should_reacquire = (
+            solved
+            and session.status == BoardStatus.TRACKING_LOST
+            and frame_idx % max(getattr(args, "reacquire_every_n_frames", 15), 1) == 0
         )
 
-        if should_track_this_frame:
-            detected, reason, track_ms, stab_alpha, mean_motion_px = update_board_tracking(
-                frame=frame,
-                session=session,
-                args=args,
-                frame_idx=frame_idx,
-                stabilizer=stabilizer,
-            )
+        if should_reacquire:
+            try:
+                t0 = time.perf_counter()
+                corners, timing = detect_board_corners_only(
+                    frame,
+                    repo_root=args.repo_root,
+                )
+                last_track_ms = timing.get(
+                    "segmentation_ms",
+                    (time.perf_counter() - t0) * 1000.0,
+                )
 
-            last_track_reason = reason
-            last_track_ms = track_ms
-            last_stabilizer_alpha = stab_alpha
-            last_mean_motion_px = mean_motion_px
+                scored = score_corners(
+                    corners,
+                    frame_shape=frame.shape,
+                    previous_corners=session.smoothed_corners,
+                )
 
-            if detected:
-                tracking_attempts_since_seen = 0
-            else:
-                tracking_attempts_since_seen += 1
+                if scored.detected and scored.corners is not None:
+                    init_result = flow.initialize(frame, scored.corners)
 
-                if (
-                    session.solution is not None
-                    and tracking_attempts_since_seen >= args.lost_after_tracking_attempts
-                ):
-                    session.status = BoardStatus.TRACKING_LOST
+                    if init_result.ok and init_result.corners is not None:
+                        flow_ok = True
+                        session.smoothed_corners = init_result.corners
+                        session.last_corners = init_result.corners
+                        session.last_seen_frame_idx = frame_idx
+                        session.tracking_quality = scored.quality
+                        session.status = BoardStatus.REACQUIRED
+                        last_reason = f"reacquired: {init_result.reason}"
+                    else:
+                        flow_ok = False
+                        last_reason = f"reacq flow init failed: {init_result.reason}"
+                else:
+                    flow_ok = False
+                    last_reason = f"reacq detect failed: {scored.reason}"
 
-                if session.solution is None:
-                    session.status = BoardStatus.NO_BOARD
+            except Exception as exc:
+                flow_ok = False
+                last_reason = f"reacq failed: {type(exc).__name__}: {exc}"
 
         if session.status == BoardStatus.TRACKING_LOST and previous_status != BoardStatus.TRACKING_LOST:
             loss_events += 1
@@ -558,18 +612,17 @@ def run_video_mode(args: argparse.Namespace) -> None:
                 (
                     f"state={session.status.value} frame={frame_idx} "
                     f"solve_ms={session.solve_latency_ms:.1f} "
-                    f"track_ms={last_track_ms:.1f} q={session.tracking_quality:.2f}"
+                    f"flow_ms={last_track_ms:.1f} q={session.tracking_quality:.2f}"
                 ),
                 (
-                    f"track={args.track_board} every={args.track_every_n_frames} "
-                    f"stab_a={last_stabilizer_alpha:.2f} "
-                    f"motion={last_mean_motion_px:.1f}px"
+                    f"flow={flow_ok} pts={last_flow_points} "
+                    f"inliers={last_flow_inliers} ratio={last_flow_ratio:.2f}"
                 ),
                 f"loss_events={loss_events} reacq_events={reacquisition_events}",
             ]
 
-            if last_track_reason:
-                lines.append(f"tracking: {last_track_reason[:90]}")
+            if last_reason:
+                lines.append(f"tracking: {last_reason[:95]}")
             if last_error:
                 lines.append(last_error[:95])
 
@@ -586,6 +639,8 @@ def run_video_mode(args: argparse.Namespace) -> None:
         writer.release()
     cap.release()
 
+    tracking_uptime = (tracking_frames / processed_frames) if processed_frames else 0.0
+
     print(f"Wrote output video: {out_path}")
     print(f"Processed frames: {processed_frames}")
     print(f"Wall time: {elapsed:.2f} sec")
@@ -593,6 +648,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
         print(f"Processing FPS: {processed_frames / elapsed:.2f}")
     print(f"Final state: {session.status.value}")
     print(f"Solve latency ms: {session.solve_latency_ms:.2f}")
+    print(f"Tracking uptime: {tracking_uptime:.3f}")
     print(f"Tracking loss events: {loss_events}")
     print(f"Reacquisition events: {reacquisition_events}")
 
@@ -664,6 +720,19 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Legacy solve-time corner smoothing alpha.",
     )
+
+    parser.add_argument("--flow-max-corners", type=int, default=600)
+    parser.add_argument("--flow-min-points", type=int, default=18)
+    parser.add_argument("--flow-min-inlier-ratio", type=float, default=0.45)
+    parser.add_argument("--flow-ransac-reproj-threshold", type=float, default=4.0)
+    parser.add_argument("--flow-refresh-points-every", type=int, default=5)
+    parser.add_argument(
+        "--reacquire-every-n-frames",
+        type=int,
+        default=15,
+        help="When tracking is lost in video mode, try segmentation reacquisition every N frames.",
+    )
+
     parser.add_argument(
         "--debug",
         action="store_true",
