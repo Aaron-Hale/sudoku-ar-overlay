@@ -1,117 +1,233 @@
 # sudoku-ar-overlay
 
-A markerless, video-based planar AR overlay for Sudoku solving.
+A markerless, recorded-video planar AR-style overlay for Sudoku solving.
 
-This project extends [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) from a static ML/CV inference pipeline into a video perception system. It detects a normal physical Sudoku puzzle, solves it once, projects missing answers onto the board plane, hides the overlay when tracking confidence is low, and reacquires the solved overlay when the board returns to view.
+This project extends [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) from a static image inference pipeline into a video perception system. It solves a Sudoku puzzle from a clean frame, projects the missing answers onto the board plane, tracks the board with optical-flow homography, hides the overlay when tracking confidence drops, and reacquires known boards using grid refinement, stability gating, and board identity caching.
 
-## Current status
+> This is **not** visual odometry, SLAM, ARKit, or ARCore. It is a bounded planar tracking system for a flat object.
 
-Local development only. Not yet published.
+---
 
-Current working branch:
+## Demo
 
-```text
-markerless-video-demo
-```
-
-Completed so far:
-
-- static image overlay
-- real solver bridge to `sudoku-image-solver`
-- webcam mode
-- freeze-frame solve usability
-- segmentation-only tracking prototype
-- optical-flow homography tracking prototype
-- rendered OpenCV output recording
-- roadmap pivot away from ArUco, SLAM, and ARKit
-
-Next major implementation target:
+Primary local demo output:
 
 ```text
-recorded iPhone video mode
+assets/demo/final_demo_clean.mp4
 ```
 
-## Demo goal
-
-The final demo should process a recorded iPhone video of a normal Sudoku puzzle:
+Debug/stress demo output:
 
 ```text
-raw iPhone video
-  -> board detection
-  -> solve once
-  -> cache solved board state
-  -> project missing digits onto the board
-  -> track while confidence is high
-  -> hide overlay when tracking confidence drops
-  -> reacquire when the board returns
-  -> write annotated MP4 and metrics
+assets/demo/processed_iphone_aggressive_known_board_identity.mp4
 ```
 
-Target command after video mode is implemented:
+The demo videos are generated artifacts and are intentionally ignored by Git. Use the run scripts below to reproduce them locally.
 
-```bash
-PYTHONPATH=src python app.py \
-  --mode video \
-  --solver real \
-  --repo-root "$HOME/projects/sudoku-image-solver" \
-  --input assets/demo/raw_iphone_lookaway.mp4 \
-  --out assets/demo/processed_lookaway_overlay.mp4 \
-  --debug
-```
+Recommended publishing flow:
+
+- keep raw/processed videos out of Git
+- upload the clean demo MP4 to a GitHub Release or portfolio page
+- optionally add a small GIF or screenshot to the README later
+
+---
 
 ## What this project demonstrates
 
-- Frozen ML vision model reuse
-- Recorded-video ingestion and output
-- Sudoku board detection and solving
-- Solve-once / render-many session state
-- Homography-based planar overlay
-- Markerless tracking from board appearance
-- Confidence-gated rendering
-- Tracking-loss handling
-- Look-away / look-back reacquisition
-- Latency, FPS, tracking, and reacquisition metrics
-- Practical failure-mode documentation
+This repo shows how a frozen ML/CV model can be wrapped into a product-like video perception application:
 
-## Product constraint
+1. Detect a normal printed Sudoku puzzle.
+2. Solve a clean video frame once using the existing image solver.
+3. Cache the solved grid and missing-cell mask.
+4. Render solved digits onto the Sudoku board plane.
+5. Track the board frame-to-frame using optical flow and homography.
+6. Hide the overlay when tracking becomes unreliable.
+7. Reacquire the board when it returns to view.
+8. Reuse known-board identity to avoid unnecessary re-solving.
+9. Report latency, tracking, and reacquisition metrics.
 
-The final user-facing demo must work with a normal Sudoku puzzle.
+The project is intentionally scoped around **markerless planar AR** rather than full 3D world anchoring.
 
-It must not require:
+---
 
-- ArUco markers
-- AprilTags
-- QR codes
-- added stickers or fiducials
-- custom board markers
-- ARKit / ARCore
-- ORB-SLAM or full SLAM
+## Current status
+
+Core demo milestone is complete.
+
+Working:
+
+- Static image overlay with the real frozen Sudoku solver
+- Recorded-video processing mode
+- Solve-once video session state
+- Optical-flow homography tracking
+- Confidence-gated fail-closed rendering
+- Grid-first and segmentation-fallback reacquisition
+- Grid-corner refinement
+- Candidate stability buffer
+- Known-board identity caching for safer reacquisition
+- Clean and debug/stress demo run scripts
+- Metrics documentation
+
+Known limitations remain, especially under aggressive motion and new-puzzle acquisition.
+
+---
+
+## Architecture
+
+```text
+Input video frame
+    |
+    |-- Initial solve frame
+    |     |
+    |     |-- sudoku-image-solver
+    |     |     |-- board segmentation
+    |     |     |-- perspective warp
+    |     |     |-- occupancy detection
+    |     |     |-- digit OCR
+    |     |     |-- Sudoku solve
+    |     |
+    |     |-- cache givens, solution, board corners, board fingerprint
+    |
+    |-- Tracking loop
+          |
+          |-- optical-flow feature tracking
+          |-- homography estimation with RANSAC
+          |-- board-corner update
+          |-- confidence checks
+          |
+          |-- if confident:
+          |     render solved digit overlay
+          |
+          |-- if not confident:
+                hide overlay
+                enter reacquisition
+```
+
+Reacquisition path:
+
+```text
+Tracking lost
+    |
+    |-- discover candidate board
+    |     |-- grid-first discovery
+    |     |-- segmentation fallback
+    |
+    |-- refine candidate corners against Sudoku grid lines
+    |
+    |-- require candidate stability across frames
+    |
+    |-- compare candidate against known-board fingerprint
+    |
+    |-- if known board:
+    |     reuse cached solution
+    |
+    |-- if new/unknown board:
+          require fresh solve before rendering
+```
+
+---
+
+## Why optical-flow homography, not visual odometry or SLAM?
+
+A Sudoku board is flat. For a flat target, a homography is the right geometric model for projecting points from the board plane into the camera image.
+
+This project uses:
+
+```text
+2D optical flow
++ RANSAC homography
++ planar overlay rendering
+```
+
+It does **not** estimate a 3D camera trajectory through the world. It does **not** build a map. It does **not** maintain persistent world anchors after the board is completely out of view.
+
+That is intentional. The goal is a credible, bounded MLE/perception demo, not a full mobile AR platform.
+
+---
+
+## Repository layout
+
+```text
+.
+├── app.py
+├── docs/
+│   ├── metrics.md
+│   ├── project_status.md
+│   └── ROADMAP_CONTRACT.md
+├── scripts/
+│   ├── demo_runs/
+│   │   ├── run_aggressive_known_board_identity.sh
+│   │   └── run_aggressive_known_board_identity_clean.sh
+│   ├── debug_grid_refinement.py
+│   ├── debug_reacquisition_stability.py
+│   ├── debug_second_puzzle_candidates.py
+│   └── debug_second_puzzle_segmentation.py
+└── src/sudoku_ar_overlay/
+    ├── board_identity.py
+    ├── board_state.py
+    ├── config.py
+    ├── flow_tracker.py
+    ├── grid_discovery.py
+    ├── grid_refinement.py
+    ├── grid_validation.py
+    ├── overlay.py
+    ├── reacquisition.py
+    ├── smoothing.py
+    ├── solver_adapter.py
+    ├── stabilizer.py
+    └── tracking.py
+```
+
+---
 
 ## Relationship to `sudoku-image-solver`
 
-The existing model repo owns:
+This repo depends on the frozen model/runtime from the companion repo:
 
-- board detection
-- grid warping
-- occupancy inference
-- digit inference
-- Sudoku solving
+```text
+~/projects/sudoku-image-solver
+```
 
-This repo owns:
+The AR overlay repo does not retrain the Sudoku solver. It treats the solver as a model artifact and focuses on the application/perception layer around it:
 
-- video application logic
-- AR-style overlay rendering
+- video ingestion
 - session state
-- markerless tracking
-- confidence scoring
-- tracking-loss handling
+- tracking
+- confidence gates
 - reacquisition
-- demo packaging
-- metrics documentation
+- overlay rendering
+- metrics and demo packaging
 
-## Current working commands
+This is the intended portfolio signal: taking a trained model pipeline and turning it into a usable video system.
 
-### Static image overlay
+---
+
+## Setup
+
+From this repo:
+
+```bash
+cd "$HOME/Desktop/sudoku-ar-overlay"
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+The real solver path expects the companion repo to exist locally:
+
+```text
+$HOME/projects/sudoku-image-solver
+```
+
+The demo commands use:
+
+```bash
+--repo-root "$HOME/projects/sudoku-image-solver"
+```
+
+---
+
+## Run static image mode
 
 ```bash
 PYTHONPATH=src python app.py \
@@ -120,149 +236,173 @@ PYTHONPATH=src python app.py \
   --repo-root "$HOME/projects/sudoku-image-solver" \
   --image "$HOME/Desktop/sudoku_solver/data/raw/core_test/cte_0022.jpg" \
   --out assets/demo/app_static_real_overlay.jpg
-
-open assets/demo/app_static_real_overlay.jpg
 ```
 
-### Webcam mode
+---
+
+## Run the clean recorded-video demo
+
+The clean demo writes a no-debug MP4 to:
+
+```text
+assets/demo/final_demo_clean.mp4
+```
+
+Command:
 
 ```bash
-PYTHONPATH=src python app.py \
-  --mode webcam \
-  --solver real \
-  --repo-root "$HOME/projects/sudoku-image-solver"
+scripts/demo_runs/run_aggressive_known_board_identity_clean.sh
 ```
 
-Useful controls:
+---
+
+## Run the debug/stress recorded-video demo
+
+The debug/stress demo writes an annotated MP4 to:
 
 ```text
-s      solve current/frozen frame
-f      freeze/unfreeze frame
-space  freeze/unfreeze frame
-a      toggle auto-solve
-r      reset
-q      quit
+assets/demo/processed_iphone_aggressive_known_board_identity.mp4
 ```
 
-Webcam mode is experimental. The primary demo path is recorded iPhone video.
+Command:
 
-## Architecture
+```bash
+scripts/demo_runs/run_aggressive_known_board_identity.sh
+```
+
+---
+
+## Metrics
+
+Latest clean demo run:
+
+| Metric | Value |
+|---|---:|
+| Input FPS | 30.00 |
+| Total frames | 1,568 |
+| Initial solve frame | 10 |
+| Initial solve latency | 318.66 ms |
+| Segmentation latency | 278.01 ms |
+| Warp/crop latency | 1.23 ms |
+| OCR latency | 37.20 ms |
+| Sudoku solve latency | 2.22 ms |
+| Offline processing FPS | 15.31 |
+| Tracking uptime | 0.706 |
+| Tracking loss events | 3 |
+| Reacquisition events | 3 |
+| Final state | SOLVED_TRACKING |
+
+See the full metrics file:
 
 ```text
-Recorded iPhone video
-  -> frame reader
-  -> board detection / reacquisition
-  -> frozen Sudoku solver
-  -> board session state
-  -> markerless tracking
-  -> homography overlay renderer
-  -> confidence gate
-  -> annotated output video + metrics
+docs/metrics.md
 ```
 
-Core design:
+Important interpretation:
+
+- processing FPS is offline video-processing throughput, not live camera FPS
+- input video is a recorded 30 FPS iPhone clip
+- the demo prioritizes correct fail-closed behavior over never losing tracking
+
+---
+
+## Key implementation details
+
+### Solve-once inference
+
+The system avoids running OCR every frame. It solves a clean frame once, then reuses the cached solution while tracking the board plane.
+
+### Optical-flow homography tracking
+
+The tracker follows feature points frame-to-frame and estimates a homography with RANSAC. The solved overlay is warped into the current frame using the updated board corners.
+
+### Fail-closed rendering
+
+When tracking becomes implausible, the overlay is hidden rather than forced onto the wrong region.
+
+Checks include:
+
+- flow point count
+- inlier ratio
+- board area change
+- corner jump
+- corner quality
+- minimum board area
+
+### Grid-first discovery and segmentation fallback
+
+When tracking is lost, the system looks for Sudoku-like board candidates using grid structure and segmentation fallback.
+
+### Grid-corner refinement
+
+Rough candidate corners are refined against detected Sudoku grid-line peaks before the overlay is reattached.
+
+### Candidate stability buffer
+
+The app does not immediately render on the first returned candidate. It waits for a short window of stable detections to avoid attaching to a moving or partially visible board.
+
+### Known-board identity caching
+
+After the initial solve, the app caches a board fingerprint. If the same board returns, the system can reuse the clean original solution instead of re-solving from a degraded later frame.
+
+---
+
+## Failure modes and limitations
+
+This project is a portfolio demo, not a production AR app.
+
+Known limitations:
+
+- Works best on printed Sudoku boards with good lighting and moderate motion.
+- Very fast camera movement can trigger tracking loss.
+- Reacquisition may be delayed until the board is stable enough.
+- New-puzzle acquisition is harder than known-board reacquisition.
+- A poor crop can still cause OCR errors.
+- A wrong OCR grid can produce a valid but wrong Sudoku solution if accepted from a single frame.
+- Known-board identity caching helps previously solved boards but is not a general-purpose object recognition system.
+- Webcam mode remains experimental.
+- This is not full 3D world anchoring, visual odometry, SLAM, ARKit, or ARCore.
+
+The intended safety behavior is:
 
 ```text
-solve once
-render many times
-hide when uncertain
-reacquire when visible again
+uncertain tracking or identity
+→ show no overlay
 ```
 
-## Tracking states
+A missing overlay is better than a confidently wrong overlay.
 
-```text
-NO_BOARD
-BOARD_DETECTED
-SOLVED_TRACKING
-TRACKING_LOST
-REACQUIRED
-```
-
-Expected behavior:
-
-```text
-Board visible
-  -> detect board
-  -> solve once
-  -> render overlay
-
-Tracking confidence high
-  -> show overlay
-
-Tracking confidence low
-  -> hide overlay
-  -> enter TRACKING_LOST
-
-Board returns
-  -> reacquire board
-  -> reuse cached solution
-  -> enter REACQUIRED
-```
-
-## Why not SLAM?
-
-This project does not use SLAM because the primary task is board-plane anchoring, not global camera localization.
-
-SLAM could help estimate camera motion in a world map, but it would not remove the need for board detection, board identity, homography rendering, confidence gating, tracking-loss behavior, and board reacquisition.
-
-For a three-week MLE portfolio build, markerless planar video tracking gives a better reliability-to-complexity tradeoff than integrating ORB-SLAM, RTAB-Map, pySLAM, ARKit, or ARCore.
-
-## Why no ArUco / fiducial markers?
-
-Fiducial markers are useful for debugging planar AR, but they violate the product constraint.
-
-The final demo should work from a normal Sudoku puzzle without printed codes, markers, stickers, or extra visual aids.
-
-## Success definition
-
-The project is successful when it can:
-
-1. Process a recorded iPhone video of a normal Sudoku puzzle.
-2. Detect the Sudoku board.
-3. Solve it once.
-4. Overlay only the originally missing digits.
-5. Keep the overlay attached during controlled, moderate camera movement.
-6. Hide the overlay when tracking confidence drops.
-7. Enter `TRACKING_LOST` when the board leaves view.
-8. Reacquire the board when it returns.
-9. Redraw the cached solved overlay.
-10. Report useful latency, FPS, tracking uptime, loss, and reacquisition metrics.
-
-The project does not need to track through fast motion. It needs to handle fast motion professionally by failing closed and reacquiring.
-
-## Planned metrics
-
-| Metric | Purpose |
-|---|---|
-| Solve latency | Cost of frozen Sudoku inference |
-| Render FPS | Output-video processing speed |
-| Tracking uptime | Percent of frames with confident overlay |
-| Tracking loss count | How often tracking failed closed |
-| Reacquisition time | Time to reattach after board return |
-| Failure reasons | Blur, low contrast, partial board, fast motion, etc. |
-
-## Known limitations
-
-Expected limitations:
-
-- works best on printed Sudoku puzzles
-- assumes one board at a time
-- assumes the puzzle is approximately planar
-- works best with good lighting and moderate camera movement
-- fast motion can cause tracking loss
-- faint gridlines, glare, blur, or partial occlusion may reduce tracking confidence
-- significant paper bending violates the planar homography assumption
-- live webcam mode is less robust than recorded iPhone video
+---
 
 ## Future work
 
-Possible extensions:
+Possible next improvements:
 
-- faster board-corner detector
-- stronger template-assisted matching
-- learned feature matching such as SuperPoint / LightGlue
-- better board fingerprinting
-- approximate `solvePnP` pose visualization
-- mobile AR/VIO integration
-- multi-clip evaluation harness
+- Multi-frame solve confirmation for new puzzles
+- Best-candidate solve ranking across a candidate cluster
+- Stronger board identity model
+- Lightweight template matching for faster known-board reacquisition
+- Cleaner demo GIF generation
+- More formal evaluation across multiple videos
+- Optional mobile/native AR implementation
+- Optional ARKit/ARCore prototype
+- Optional full SLAM/VIO comparison
+
+---
+
+## Portfolio framing
+
+This project is meant to show the practical engineering layer between a model and a usable perception product:
+
+- model integration
+- latency management
+- tracking system design
+- confidence gates
+- failure-mode analysis
+- debug instrumentation
+- reproducible demo runs
+- honest limitations
+
+The core technical story:
+
+> I took a frozen Sudoku image solver and built a markerless recorded-video planar AR overlay around it, using optical-flow homography tracking, grid refinement, stability-gated reacquisition, and known-board identity caching to produce a credible video perception demo.
