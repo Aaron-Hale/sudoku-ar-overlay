@@ -2127,3 +2127,938 @@ The next portfolio-quality milestone is:
 After that:
 
 > A different puzzle enters frame, cached overlay is blocked, and the system requires a fresh solve before rendering.
+
+
+# `sudoku-ar-overlay` Status Update — Stable Reacquisition Milestone
+
+**Date:** 2026-04-24  
+**Recommended section:** Append as `## 22` in `docs/project_status.md`  
+**Current branch:** `markerless-video-demo`  
+**Purpose:** Preserve the current working milestone before pushing further on aggressive/new-puzzle reacquisition.
+
+---
+
+## 22. Update — Stable Refined Reacquisition Works; Aggressive New-Puzzle Stress Test Exposes Remaining Gap
+
+### 22.1 Executive summary
+
+The project has reached a meaningful working milestone.
+
+The latest markerless recorded-video pipeline now produces a credible demo:
+
+```text
+clean initial solve
+→ optical-flow tracking during moderate motion
+→ fail-closed overlay hiding when tracking becomes implausible
+→ grid-first discovery when the board returns
+→ grid-corner refinement
+→ stability-buffered reacquisition
+→ overlay reappears with acceptable fit
+```
+
+This is the best version so far and should be treated as the current baseline.
+
+The system is now strong enough to package as an MLE portfolio demo if framed correctly:
+
+> A markerless planar AR-style video perception system that turns a frozen Sudoku image solver into a video overlay application with solve-once inference, optical-flow tracking, confidence-gated rendering, grid-first reacquisition, corner refinement, and safe failure behavior.
+
+The remaining gap is not basic tracking. The remaining gap is robust **new-puzzle acquisition under aggressive motion**, especially when a second/different puzzle enters the frame and must be solved fresh rather than reusing the cached solution.
+
+---
+
+### 22.2 Current repo/checkpoint status
+
+Recent confirmed commits:
+
+```text
+b4f5fa1 Add grid refinement and reacquisition stability diagnostics
+7a13a98 Add grid-first discovery and fail-fast video tracking diagnostics
+2a44725 Add fail-fast solver timeout and grid candidate validation
+eea7901 Disable solve-based reacquisition by default
+b0ad123 Update status after first optical-flow video success
+8aafd3d Use optical flow tracking in video mode
+```
+
+Important note:
+
+The most recent `app.py` integration that uses stable refined grid candidates may or may not be committed yet, depending on whether the commit was created after copying in:
+
+```text
+app_stability_integrated.py
+```
+
+Before continuing, verify:
+
+```bash
+cd "$HOME/Desktop/sudoku-ar-overlay"
+source .venv/bin/activate
+
+git status --short
+git log --oneline -8
+python -m py_compile app.py
+```
+
+If `app.py` is modified and the stable reacquisition behavior is the current best version, preserve it with:
+
+```bash
+git add app.py
+git commit -m "Use stable refined grid candidates for video reacquisition"
+```
+
+Do not commit generated demo videos/images under `assets/` unless intentionally selecting a small final artifact.
+
+---
+
+### 22.3 Files/modules now added or materially changed
+
+The project now includes several important modules beyond the original static overlay pipeline.
+
+#### Core video/tracking app
+
+```text
+app.py
+```
+
+Current role:
+
+- video mode
+- initial solve frame
+- optical-flow tracking
+- fail-closed tracking loss
+- grid-first discovery
+- stable refined reacquisition
+- debug overlays / state text
+- MP4 output
+
+#### Optical-flow tracker
+
+```text
+src/sudoku_ar_overlay/flow_tracker.py
+```
+
+Purpose:
+
+- track board points frame-to-frame
+- estimate homography with RANSAC
+- update board corners quickly without rerunning full segmentation/OCR every frame
+
+#### Grid validation
+
+```text
+src/sudoku_ar_overlay/grid_validation.py
+```
+
+Important functions:
+
+```text
+validate_sudoku_grid_candidate(...)
+warp_candidate(...)
+evaluate_sudoku_grid_fit(...)
+```
+
+Purpose:
+
+- reject false positives such as carpet/rug/table texture
+- check whether a candidate actually contains Sudoku-like grid-line evidence
+- check whether candidate corners align with expected Sudoku grid-line locations
+
+#### Grid-first discovery
+
+```text
+src/sudoku_ar_overlay/grid_discovery.py
+```
+
+Purpose:
+
+- search for Sudoku-like grid candidates directly from line/contour structure
+- avoid blindly trusting the segmentation model during reacquisition
+- prevent false positive candidate regions from reaching OCR/rendering
+
+#### Grid refinement
+
+```text
+src/sudoku_ar_overlay/grid_refinement.py
+```
+
+Purpose:
+
+- take rough candidate corners
+- warp to canonical view
+- find actual Sudoku grid-line peaks
+- refine outer corners to better match the printed Sudoku grid
+- reduce skew in reacquired overlays
+
+#### Reacquisition stability buffer
+
+```text
+src/sudoku_ar_overlay/reacquisition.py
+```
+
+Important classes:
+
+```text
+ReacquisitionCandidate
+StabilityResult
+CandidateStabilityBuffer
+```
+
+Purpose:
+
+- collect candidate detections over multiple frames
+- reject candidates while the board is still entering the frame or moving too much
+- release only stable refined candidates for overlay initialization or fresh solving
+
+#### Debug scripts
+
+```text
+scripts/debug_grid_refinement.py
+scripts/debug_reacquisition_stability.py
+```
+
+Purpose:
+
+- inspect rough vs refined corners on specific frames
+- evaluate return-sequence stability
+- produce diagnostic overlays, warps, CSVs, and montages
+
+These scripts were essential in proving that single-frame refinement works and that the prior skew came from reacquiring too early during motion.
+
+---
+
+### 22.4 Major technical finding: the reacquisition problem was not one bug
+
+The project uncovered several distinct failure modes that initially looked like one issue.
+
+#### Failure mode 1 — optical flow attaches to random background
+
+Earlier behavior:
+
+```text
+board leaves frame
+→ optical flow tries to keep fitting old overlay somewhere
+→ overlay sticks to random background
+```
+
+Current fix:
+
+- motion/geometry plausibility gates
+- area-jump checks
+- corner-jump checks
+- inlier-ratio checks
+- minimum board-area checks
+- confidence-gated render policy
+- immediate hide on tracking loss
+
+Current status:
+
+```text
+Mostly fixed.
+The overlay now fails closed instead of confidently sticking to random objects.
+```
+
+#### Failure mode 2 — full solve can hang on invalid OCR givens
+
+Earlier behavior:
+
+```text
+bad candidate frame
+→ OCR predicts invalid givens
+→ naive Sudoku backtracker spends a long time proving unsolvable
+→ app appears hung
+```
+
+Current fix:
+
+- fail-fast MRV Sudoku solver
+- duplicate-givens validation before search
+- timeout wrapper around solve calls
+
+Current status:
+
+```text
+Fixed enough for demo safety.
+Bad givens now fail quickly instead of hanging for many minutes.
+```
+
+#### Failure mode 3 — detector selects a rug/carpet, not the Sudoku board
+
+Diagnostic result:
+
+```text
+frame_0010: real Sudoku board accepted
+frame_0670: rug/carpet false positive rejected
+```
+
+The grid validator distinguished them:
+
+```text
+frame_0010 True  grid ok: score=0.160 v_peak=0.141 h_peak=0.179 v_lines=7 h_lines=10
+frame_0670 False grid rejected: score=-0.007 v_peak=-0.012 h_peak=-0.003 v_lines=1 h_lines=3
+```
+
+Current fix:
+
+- grid validation
+- grid-first discovery
+- reject non-grid candidates before solve/render
+
+Current status:
+
+```text
+Major improvement.
+False positives like carpet/rug candidates are now rejectable.
+```
+
+#### Failure mode 4 — rough reacquisition corners cause skewed overlay
+
+Earlier behavior:
+
+```text
+board returns
+→ rough candidate found
+→ overlay initializes immediately
+→ overlay is skewed / poorly fit
+```
+
+Current fix:
+
+- grid-corner refinement
+- evaluate grid fit
+- candidate stability buffer
+- delay overlay until candidate is stable
+
+Current status:
+
+```text
+Substantially improved.
+The latest stable/fast reacquisition videos are the best so far.
+```
+
+#### Failure mode 5 — second/new puzzle may be missed in aggressive video
+
+Current behavior on aggressive stress clip:
+
+```text
+first known puzzle:
+  performs relatively well
+
+second/different puzzle:
+  can be missed or fail to acquire
+```
+
+Current interpretation:
+
+```text
+The first puzzle has an advantage because it was solved from a clean upfront frame and may use the known-session path.
+
+The second puzzle must go through the harder new-puzzle path:
+  discover grid
+  refine corners
+  wait for stability
+  run fresh solve on candidate
+  initialize flow
+```
+
+This is the next gap, but it is a narrower problem than before.
+
+---
+
+### 22.5 Commands that produced the best current demo behavior
+
+The stable candidate version worked well enough to be considered a decent demo:
+
+```bash
+PYTHONPATH=src python app.py \
+  --mode video \
+  --solver real \
+  --repo-root "$HOME/projects/sudoku-image-solver" \
+  --input assets/demo/raw_iphone_demo2_1080p30.mp4 \
+  --out assets/demo/processed_iphone_demo2_stable_reacq.mp4 \
+  --solve-frame 10 \
+  --flow-max-corners 600 \
+  --flow-min-points 30 \
+  --flow-min-inlier-ratio 0.60 \
+  --flow-ransac-reproj-threshold 4.0 \
+  --flow-refresh-points-every 5 \
+  --discover-every-n-frames 5 \
+  --enable-discovery-solve \
+  --solve-timeout-sec 6 \
+  --discover-solve-cooldown-frames 90 \
+  --discover-max-solve-attempts 4 \
+  --reacquire-min-board-area-frac 0.025 \
+  --reacquire-max-candidate-shift-frac 0.18 \
+  --video-min-area-change-ratio 0.65 \
+  --video-max-area-change-ratio 1.60 \
+  --video-max-corner-jump-frac 0.20 \
+  --same-pose-center-frac 0.35 \
+  --same-pose-min-area-ratio 0.45 \
+  --same-pose-max-area-ratio 2.25 \
+  --fit-max-mean-error-px 14 \
+  --fit-min-found-lines 7 \
+  --refine-max-mean-error-px 18 \
+  --refine-min-found-lines 7 \
+  --reacq-stable-min-frames 4 \
+  --reacq-stable-max-center-motion-frac 0.025 \
+  --reacq-stable-max-area-ratio 1.18 \
+  --reacq-stable-max-corner-motion-frac 0.035 \
+  --debug
+```
+
+A faster version improved pickup speed and still looked good:
+
+```bash
+PYTHONPATH=src python app.py \
+  --mode video \
+  --solver real \
+  --repo-root "$HOME/projects/sudoku-image-solver" \
+  --input assets/demo/raw_iphone_demo2_1080p30.mp4 \
+  --out assets/demo/processed_iphone_demo2_stable_reacq_fast.mp4 \
+  --solve-frame 10 \
+  --flow-max-corners 600 \
+  --flow-min-points 30 \
+  --flow-min-inlier-ratio 0.60 \
+  --flow-ransac-reproj-threshold 4.0 \
+  --flow-refresh-points-every 5 \
+  --discover-every-n-frames 3 \
+  --enable-discovery-solve \
+  --solve-timeout-sec 6 \
+  --discover-solve-cooldown-frames 60 \
+  --discover-max-solve-attempts 4 \
+  --reacquire-min-board-area-frac 0.025 \
+  --reacquire-max-candidate-shift-frac 0.18 \
+  --video-min-area-change-ratio 0.65 \
+  --video-max-area-change-ratio 1.60 \
+  --video-max-corner-jump-frac 0.20 \
+  --same-pose-center-frac 0.35 \
+  --same-pose-min-area-ratio 0.45 \
+  --same-pose-max-area-ratio 2.25 \
+  --fit-max-mean-error-px 14 \
+  --fit-min-found-lines 7 \
+  --refine-max-mean-error-px 18 \
+  --refine-min-found-lines 7 \
+  --reacq-stable-min-frames 3 \
+  --reacq-stable-max-center-motion-frac 0.030 \
+  --reacq-stable-max-area-ratio 1.22 \
+  --reacq-stable-max-corner-motion-frac 0.040 \
+  --debug
+```
+
+An even faster/ultrafast version was tested:
+
+```bash
+PYTHONPATH=src python app.py \
+  --mode video \
+  --solver real \
+  --repo-root "$HOME/projects/sudoku-image-solver" \
+  --input assets/demo/raw_iphone_demo2_1080p30.mp4 \
+  --out assets/demo/processed_iphone_demo2_stable_reacq_ultrafast.mp4 \
+  --solve-frame 10 \
+  --flow-max-corners 600 \
+  --flow-min-points 30 \
+  --flow-min-inlier-ratio 0.60 \
+  --flow-ransac-reproj-threshold 4.0 \
+  --flow-refresh-points-every 5 \
+  --discover-every-n-frames 2 \
+  --enable-discovery-solve \
+  --solve-timeout-sec 6 \
+  --discover-solve-cooldown-frames 45 \
+  --discover-max-solve-attempts 4 \
+  --reacquire-min-board-area-frac 0.025 \
+  --reacquire-max-candidate-shift-frac 0.20 \
+  --video-min-area-change-ratio 0.65 \
+  --video-max-area-change-ratio 1.60 \
+  --video-max-corner-jump-frac 0.20 \
+  --same-pose-center-frac 0.40 \
+  --same-pose-min-area-ratio 0.40 \
+  --same-pose-max-area-ratio 2.50 \
+  --fit-max-mean-error-px 16 \
+  --fit-min-found-lines 7 \
+  --refine-max-mean-error-px 20 \
+  --refine-min-found-lines 7 \
+  --reacq-stable-min-frames 2 \
+  --reacq-stable-max-center-motion-frac 0.040 \
+  --reacq-stable-max-area-ratio 1.30 \
+  --reacq-stable-max-corner-motion-frac 0.050 \
+  --debug
+```
+
+User assessment:
+
+```text
+The faster versions are better.
+This is now a decent demo.
+The remaining drawback is that reacquisition could still be faster.
+```
+
+Recommended baseline:
+
+```text
+Use the fast or ultrafast run as the current demo baseline, depending on which visually preserves better overlay alignment.
+Do not regress to earlier non-stability-buffered reacquisition.
+```
+
+---
+
+### 22.6 Standalone diagnostics that proved the stability/refinement approach
+
+#### Grid refinement diagnostic
+
+Script:
+
+```text
+scripts/debug_grid_refinement.py
+```
+
+Output files inspected:
+
+```text
+rough_overlay.jpg
+refined_overlay.jpg
+rough_warp.jpg
+refined_warp.jpg
+```
+
+Finding:
+
+```text
+Rough and refined corners both looked solid on the still frame.
+This suggested that grid refinement can work.
+The skew seen in video was likely caused by attaching too early while the board was moving, not by an impossible corner-refinement problem.
+```
+
+#### Reacquisition stability diagnostic
+
+Script:
+
+```text
+scripts/debug_reacquisition_stability.py
+```
+
+Output files inspected:
+
+```text
+first_stable_overlay.jpg
+first_stable_warp.jpg
+reacq_stability_montage.jpg
+reacq_stability.csv
+```
+
+Key finding:
+
+```text
+The board starts returning around frame ~580.
+Grid discovery does not produce a valid candidate until around frame ~620.
+The stability buffer releases the first stable candidate around frame ~635.
+```
+
+With the diagnostic settings:
+
+```text
+620 pending 1/4
+625 pending 2/4
+630 pending 3/4
+635 stable
+```
+
+This means:
+
+```text
+0.5 sec after first partial appearance
+~0.13 sec after first valid candidate
+```
+
+The fit error was low:
+
+```text
+frame 635 stable: fit approximately 2.8 px
+frame 670 stable: fit approximately 1.8 px
+```
+
+Conclusion:
+
+```text
+Candidate stability buffering is the correct fix for the skewed reacquisition problem.
+```
+
+---
+
+### 22.7 Aggressive stress-test video result
+
+A more aggressive iPhone video was recorded and processed.
+
+Representative command:
+
+```bash
+PYTHONPATH=src python app.py \
+  --mode video \
+  --solver real \
+  --repo-root "$HOME/projects/sudoku-image-solver" \
+  --input assets/demo/raw_iphone_aggressive_1080p30.mp4 \
+  --out assets/demo/processed_iphone_aggressive_ultrafast_debug.mp4 \
+  --solve-frame 10 \
+  --flow-max-corners 600 \
+  --flow-min-points 30 \
+  --flow-min-inlier-ratio 0.60 \
+  --flow-ransac-reproj-threshold 4.0 \
+  --flow-refresh-points-every 5 \
+  --discover-every-n-frames 2 \
+  --enable-discovery-solve \
+  --solve-timeout-sec 6 \
+  --discover-solve-cooldown-frames 45 \
+  --discover-max-solve-attempts 6 \
+  --reacquire-min-board-area-frac 0.025 \
+  --reacquire-max-candidate-shift-frac 0.20 \
+  --video-min-area-change-ratio 0.65 \
+  --video-max-area-change-ratio 1.60 \
+  --video-max-corner-jump-frac 0.20 \
+  --same-pose-center-frac 0.40 \
+  --same-pose-min-area-ratio 0.40 \
+  --same-pose-max-area-ratio 2.50 \
+  --fit-max-mean-error-px 16 \
+  --fit-min-found-lines 7 \
+  --refine-max-mean-error-px 20 \
+  --refine-min-found-lines 7 \
+  --reacq-stable-min-frames 2 \
+  --reacq-stable-max-center-motion-frac 0.040 \
+  --reacq-stable-max-area-ratio 1.30 \
+  --reacq-stable-max-corner-motion-frac 0.050 \
+  --debug
+```
+
+Observed behavior:
+
+```text
+First puzzle:
+  system performs reasonably well
+
+Second/different puzzle:
+  system misses or fails to acquire reliably
+```
+
+Current interpretation:
+
+```text
+The first puzzle benefits from clean initial solve and/or known-session state.
+The second puzzle must go through the fresh new-puzzle acquisition path.
+The new-puzzle path is currently weaker.
+```
+
+This is not a reason to discard the current demo. It identifies the next targeted improvement.
+
+---
+
+### 22.8 Why the second puzzle is missed
+
+Likely causes:
+
+```text
+1. Stability buffer rejects the second puzzle while it is moving.
+2. Discovery finds candidates, but not long enough / stable enough to trigger solve.
+3. Full-solve attempts may be spent on poor early candidates.
+4. Global discover-max-solve-attempts may be burned before the best second-puzzle frame appears.
+5. Fresh candidate crop solving is more brittle than the cached known-puzzle path.
+6. The second puzzle may be present for too few stable frames under the aggressive motion.
+```
+
+Most important distinction:
+
+```text
+Known puzzle path:
+  can reuse cached state if same-pose/same-identity evidence is strong
+
+New puzzle path:
+  must fresh-solve before any overlay appears
+```
+
+The miss is acceptable as a stress-test failure if the system fails safely:
+
+```text
+Good failure:
+  no overlay appears on the second puzzle
+
+Bad failure:
+  old overlay appears on the wrong puzzle
+```
+
+Current behavior appears closer to the good failure mode.
+
+---
+
+### 22.9 Recommended next improvement if we keep pushing
+
+Do not rework the tracker. The next improvement should target new-puzzle acquisition.
+
+Recommended next module/feature:
+
+```text
+CandidateCluster / best-frame fresh solve
+```
+
+New-puzzle acquisition should work like this:
+
+```text
+candidate appears
+→ refine corners
+→ track candidate cluster over ~0.5–1.0 sec
+→ score candidate frames by:
+    grid fit error
+    sharpness
+    board size
+    stability
+    grid discovery score
+→ attempt fresh solve on the best 1–3 frames
+→ accept first valid solve
+→ initialize flow from that candidate’s refined corners
+→ if all fail, show nothing and keep searching
+```
+
+This is better than the current approach:
+
+```text
+first stable candidate
+→ attempt solve
+→ cooldown / max attempts
+```
+
+The current global solve-attempt policy should eventually be replaced.
+
+Bad current-ish policy:
+
+```text
+max solve attempts per video
+```
+
+Better policy:
+
+```text
+max solve attempts per candidate cluster
+```
+
+Why:
+
+```text
+The app may burn solve attempts on early bad frames.
+Then when the second puzzle becomes clean/stable, the app may refuse or delay solving.
+```
+
+This is probably the best next technical fix for the aggressive-video second-puzzle miss.
+
+---
+
+### 22.10 Portfolio decision
+
+Current recommendation:
+
+> Package the current stable/fast reacquisition version as the main demo baseline. Do not chase full 3D world AR / SLAM / ARKit right now.
+
+Why:
+
+```text
+Sudoku is a planar object.
+Homography-based planar AR is the right abstraction.
+The current system demonstrates practical applied perception engineering.
+Full 3D world anchoring is a different project and likely a time sink.
+```
+
+The demo now shows the important MLE/product engineering skills:
+
+```text
+model reuse
+video inference wrapper
+solve-once state management
+optical-flow tracking
+homography rendering
+confidence-gated display
+fail-closed behavior
+false-positive rejection
+grid-based discovery
+corner refinement
+stability-buffered reacquisition
+bounded solve attempts
+diagnostic tooling
+honest limitations
+```
+
+This is strong enough to use as a portfolio artifact if presented honestly.
+
+Suggested README framing:
+
+> This is not a full ARKit/SLAM system. It is a markerless planar AR-style video overlay for a flat Sudoku puzzle. It uses a frozen Sudoku solver for initial inference, optical-flow homography tracking for frame-to-frame motion, and confidence-gated grid-first reacquisition to avoid rendering when pose or board identity is uncertain.
+
+---
+
+### 22.11 Current known working baseline
+
+Recommended “known good” behavior to preserve:
+
+```text
+Input:
+  controlled iPhone video
+  puzzle starts fully visible and still
+  puzzle later moves moderately
+  puzzle leaves frame
+  puzzle returns
+
+Expected:
+  initial solve succeeds quickly
+  overlay tracks during moderate motion
+  overlay hides when tracking becomes implausible
+  returned board is rediscovered
+  grid corners are refined
+  candidate must be stable before overlay appears
+  overlay reappears with acceptable fit
+```
+
+Known limitations:
+
+```text
+fast/aggressive motion can break tracking
+new/different puzzle acquisition is not yet reliable
+second puzzle in aggressive stress test can be missed
+reacquisition is slightly slower than ideal
+overlay fit depends on stable returned frames
+not a true world-anchored 3D AR system
+not a live production mobile app
+```
+
+---
+
+### 22.12 Recommended immediate preservation steps
+
+Before experimenting further, preserve the working state.
+
+Run:
+
+```bash
+cd "$HOME/Desktop/sudoku-ar-overlay"
+source .venv/bin/activate
+
+python -m py_compile app.py
+python -m py_compile src/sudoku_ar_overlay/solver_adapter.py
+python -m py_compile src/sudoku_ar_overlay/grid_validation.py
+python -m py_compile src/sudoku_ar_overlay/grid_discovery.py
+python -m py_compile src/sudoku_ar_overlay/grid_refinement.py
+python -m py_compile src/sudoku_ar_overlay/reacquisition.py
+
+git status --short
+git log --oneline -8
+```
+
+If `app.py` contains the stable integrated reacquisition behavior and is not committed yet:
+
+```bash
+git add app.py
+git commit -m "Use stable refined grid candidates for video reacquisition"
+```
+
+Then, optionally tag or branch the milestone:
+
+```bash
+git tag stable-reacq-demo-v1
+```
+
+or:
+
+```bash
+git switch -c stable-reacq-demo-v1
+```
+
+Do not commit all of `assets/` by accident.
+
+---
+
+### 22.13 Recommended next step after preservation
+
+After preserving this baseline, choose one of two paths.
+
+#### Option A — Package demo now
+
+Recommended if time is tight.
+
+Tasks:
+
+```text
+select best demo video
+create clean no-debug output
+create debug output
+write README demo section
+write docs/metrics.md
+write limitations honestly
+```
+
+This is enough for a portfolio artifact.
+
+#### Option B — One more technical improvement
+
+Recommended if we want to improve aggressive/new-puzzle behavior.
+
+Build:
+
+```text
+CandidateCluster / best-frame fresh solve
+```
+
+Purpose:
+
+```text
+fix second-puzzle misses in aggressive video
+avoid burning solve attempts on bad early frames
+attempt fresh solve on best candidate frames only
+```
+
+This should be implemented as another standalone module or debug script first, not by heavily patching `app.py`.
+
+Recommended future module:
+
+```text
+src/sudoku_ar_overlay/candidate_cluster.py
+```
+
+Then integrate only after diagnostics show it picks better second-puzzle frames.
+
+---
+
+### 22.14 Bottom-line assessment
+
+This is now a real portfolio demo.
+
+It is not perfect. It is not production AR. It is not SLAM.
+
+But it does show a strong applied MLE/perception story:
+
+> I took a frozen computer-vision model and built a markerless video overlay system around it. I separated slow model inference from fast tracking, added confidence-gated rendering, made tracking fail closed, rejected false positives with grid validation, refined reacquired board corners, and used stability buffering to avoid drawing overlays on moving/partial boards.
+
+Current maturity:
+
+```text
+static overlay:
+  strong
+
+controlled recorded-video demo:
+  good
+
+moderate motion:
+  good enough
+
+look-away/look-back same-puzzle reacquisition:
+  decent and now demonstrable
+
+aggressive motion:
+  partially robust, fails closed in important cases
+
+new-puzzle reacquisition:
+  not reliable yet
+```
+
+Recommended preservation point:
+
+> Treat the current stable/fast reacquisition demo as `stable-reacq-demo-v1`.
+
+Recommended next work only if continuing:
+
+> Add candidate-cluster best-frame solving for new-puzzle acquisition.
+
+Otherwise:
+
+> Freeze this as the core demo and move to README / metrics / video polish.
+

@@ -13,6 +13,8 @@ from sudoku_ar_overlay.config import OverlayConfig, TrackingConfig
 from sudoku_ar_overlay.flow_tracker import FlowHomographyTracker
 from sudoku_ar_overlay.grid_validation import validate_sudoku_grid_candidate, warp_candidate, evaluate_sudoku_grid_fit
 from sudoku_ar_overlay.grid_discovery import find_sudoku_grid_candidate
+from sudoku_ar_overlay.grid_refinement import refine_sudoku_grid_corners
+from sudoku_ar_overlay.reacquisition import CandidateStabilityBuffer, ReacquisitionCandidate
 from sudoku_ar_overlay.overlay import draw_board_outline, render_solution_overlay
 from sudoku_ar_overlay.smoothing import smooth_corners
 from sudoku_ar_overlay.solver_adapter import (
@@ -511,6 +513,15 @@ def run_video_mode(args: argparse.Namespace) -> None:
     pending_candidate_corners = None
     pending_candidate_count = 0
 
+    reacq_buffer = CandidateStabilityBuffer(
+        min_frames=args.reacq_stable_min_frames,
+        max_history=max(args.reacq_stable_min_frames * 3, 12),
+        max_center_motion_frac=args.reacq_stable_max_center_motion_frac,
+        max_area_ratio=args.reacq_stable_max_area_ratio,
+        max_corner_motion_frac=args.reacq_stable_max_corner_motion_frac,
+        max_fit_error_px=args.fit_max_mean_error_px,
+    )
+
     loss_events = 0
     reacquisition_events = 0
     tracking_frames = 0
@@ -547,6 +558,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
         pending_candidate_corners = None
         pending_candidate_count = 0
+        reacq_buffer.reset()
         loss_events += 1
 
     def validate_tracked_corners(corners, previous_corners, frame_shape) -> tuple[bool, str, float]:
@@ -758,23 +770,32 @@ def run_video_mode(args: argparse.Namespace) -> None:
         return False
 
     def discover_candidate_and_maybe_solve(frame, frame_idx: int) -> None:
-        """Find a Sudoku-grid candidate and decide cached reacq vs fresh solve."""
+        """Grid-first discovery with refinement + stability gating.
+
+        This intentionally does not attach or solve on the first candidate frame.
+        Returned boards often enter from the side while moving, which can produce
+        rough/skewed corners. We refine the grid and require a short stable
+        candidate window before cached reacquisition or fresh solving.
+        """
         nonlocal flow_ok, last_reason, last_track_ms
         nonlocal pending_candidate_corners, pending_candidate_count
         nonlocal discovery_solve_attempts, last_discovery_solve_frame
 
         try:
             t0 = time.perf_counter()
+
+            # 1) Prefer grid-first discovery. Segmentation remains a fallback only.
             grid_candidate = find_sudoku_grid_candidate(
                 frame,
                 min_area_frac=args.reacquire_min_board_area_frac,
             )
 
             if grid_candidate.ok and grid_candidate.corners is not None:
-                last_track_ms = (time.perf_counter() - t0) * 1000.0
                 cand_ok = True
                 cand_reason = grid_candidate.reason
                 cand_corners = grid_candidate.corners
+                cand_score = grid_candidate.score
+                last_track_ms = (time.perf_counter() - t0) * 1000.0
             else:
                 corners, timing = detect_board_corners_only(
                     frame,
@@ -785,61 +806,63 @@ def run_video_mode(args: argparse.Namespace) -> None:
                     (time.perf_counter() - t0) * 1000.0,
                 )
                 cand_ok, cand_reason, cand_corners = validate_segmentation_candidate(corners, frame)
+                cand_score = 0.0
 
             if not cand_ok or cand_corners is None:
                 pending_candidate_corners = None
                 pending_candidate_count = 0
+                reacq_buffer.reset()
                 flow_ok = False
                 last_reason = f"discover rejected: {cand_reason}"
                 return
 
-            if pending_candidate_corners is None:
-                pending_candidate_corners = cand_corners.copy()
-                pending_candidate_count = 1
+            # 2) Refine rough discovery corners to printed-grid corners.
+            refined = refine_sudoku_grid_corners(
+                frame,
+                cand_corners,
+                min_found_lines=args.refine_min_found_lines,
+                max_mean_error_px=args.refine_max_mean_error_px,
+            )
+
+            if not refined.ok or refined.corners is None:
+                pending_candidate_corners = None
+                pending_candidate_count = 0
+                reacq_buffer.reset()
+                flow_ok = False
+                last_reason = f"discover refine rejected: {refined.reason}"
+                return
+
+            pending_candidate_corners = refined.corners.copy()
+            pending_candidate_count += 1
+
+            # 3) Push refined candidate into stability buffer. No rendering/solving yet.
+            stability = reacq_buffer.push(
+                ReacquisitionCandidate(
+                    frame_idx=frame_idx,
+                    corners=refined.corners,
+                    frame_shape=frame.shape,
+                    fit_error_px=refined.mean_error_px,
+                    score=float(cand_score),
+                    reason=refined.reason,
+                )
+            )
+
+            if not stability.stable or stability.candidate is None:
                 flow_ok = False
                 last_reason = (
-                    f"discover pending {pending_candidate_count}/"
-                    f"{args.discover_confirm_frames}: {cand_reason}"
+                    f"discover candidate waiting: {stability.reason}; "
+                    f"{refined.reason}; {cand_reason}"
                 )
                 return
 
-            shift = _mean_corner_jump_px(cand_corners, pending_candidate_corners)
-            max_dim = float(max(frame.shape[:2]))
-            if shift > max_dim * args.reacquire_max_candidate_shift_frac:
-                pending_candidate_corners = cand_corners.copy()
-                pending_candidate_count = 1
-                flow_ok = False
-                last_reason = f"discover candidate moved/reset: shift={shift:.1f}px"
-                return
+            stable_corners = stability.candidate.corners
 
-            pending_candidate_corners = cand_corners.copy()
-            pending_candidate_count += 1
-            last_reason = (
-                f"discover pending {pending_candidate_count}/"
-                f"{args.discover_confirm_frames}: shift={shift:.1f}px"
-            )
-
-            if pending_candidate_count < args.discover_confirm_frames:
-                return
-
-            fit = evaluate_sudoku_grid_fit(
-                frame,
-                pending_candidate_corners,
-                max_mean_error_px=args.fit_max_mean_error_px,
-                min_found_lines=args.fit_min_found_lines,
-            )
-            if not fit.ok:
-                flow_ok = False
-                pending_candidate_corners = None
-                pending_candidate_count = 0
-                last_reason = f"discover rejected: {fit.reason}"
-                return
-
+            # 4) Decide whether this is plausibly the same board location.
             same_pose_likely = False
             pose_reason = "no last pose"
             if last_good_center_px is not None and last_good_area_px is not None and last_good_area_px > 1:
-                cand_center = _quad_center_px(pending_candidate_corners)
-                cand_area = _quad_area_px(pending_candidate_corners)
+                cand_center = _quad_center_px(stable_corners)
+                cand_area = _quad_area_px(stable_corners)
                 frame_diag = float((frame.shape[0] ** 2 + frame.shape[1] ** 2) ** 0.5)
                 center_frac = float(np.linalg.norm(cand_center - last_good_center_px) / max(frame_diag, 1.0))
                 area_ratio = cand_area / last_good_area_px
@@ -849,52 +872,62 @@ def run_video_mode(args: argparse.Namespace) -> None:
                 )
                 pose_reason = f"center_frac={center_frac:.2f} area_ratio={area_ratio:.2f}"
 
+            # 5) Fast path: same-pose known board gets cached reacq after stability gate.
             if same_pose_likely and maybe_reacquire_cached_solution(
                 frame,
-                pending_candidate_corners,
+                stable_corners,
                 frame_idx,
                 pose_reason,
-                fit.reason,
+                stability.reason,
             ):
+                reacq_buffer.reset()
                 return
 
-            # Different/far pose: require fresh candidate solve before showing an overlay.
+            # 6) Different/far pose: require fresh candidate solve before rendering.
             if not args.enable_discovery_solve:
                 flow_ok = False
-                last_reason = f"new/different pose candidate; fresh solve disabled: {pose_reason}; {fit.reason}"
+                last_reason = (
+                    f"stable new/different pose candidate; fresh solve disabled: "
+                    f"{pose_reason}; {stability.reason}"
+                )
                 return
 
             frames_since_attempt = frame_idx - last_discovery_solve_frame
             if discovery_solve_attempts >= args.discover_max_solve_attempts:
                 flow_ok = False
                 last_reason = (
-                    "discover confirmed candidate, but max fresh-solve attempts reached: "
-                    f"{discovery_solve_attempts}"
+                    "stable candidate, but max fresh-solve attempts reached: "
+                    f"{discovery_solve_attempts}; {pose_reason}; {stability.reason}"
                 )
                 return
 
             if frames_since_attempt < args.discover_solve_cooldown_frames:
                 flow_ok = False
                 last_reason = (
-                    "discover confirmed candidate, but solve cooldown active: "
-                    f"{frames_since_attempt}/{args.discover_solve_cooldown_frames} frames"
+                    "stable candidate, but solve cooldown active: "
+                    f"{frames_since_attempt}/{args.discover_solve_cooldown_frames} frames; "
+                    f"{pose_reason}; {stability.reason}"
                 )
                 return
 
             discovery_solve_attempts += 1
             last_discovery_solve_frame = frame_idx
-            initialize_from_candidate_solve(
+            solved_candidate = initialize_from_candidate_solve(
                 frame=frame,
-                corners=pending_candidate_corners,
+                corners=stable_corners,
                 frame_idx=frame_idx,
-                label="fresh grid discovery",
+                label="stable grid discovery",
             )
+            if solved_candidate:
+                reacq_buffer.reset()
 
         except Exception as exc:
             pending_candidate_corners = None
             pending_candidate_count = 0
+            reacq_buffer.reset()
             flow_ok = False
             last_reason = f"discover failed: {type(exc).__name__}: {exc}"
+
 
     print(f"Reading video: {args.input}")
     print(f"Writing video: {out_path}")
@@ -1157,6 +1190,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--same-pose-max-area-ratio", type=float, default=2.25)
     parser.add_argument("--fit-max-mean-error-px", type=float, default=14.0)
     parser.add_argument("--fit-min-found-lines", type=int, default=7)
+    parser.add_argument("--refine-max-mean-error-px", type=float, default=18.0)
+    parser.add_argument("--refine-min-found-lines", type=int, default=7)
+    parser.add_argument("--reacq-stable-min-frames", type=int, default=4)
+    parser.add_argument("--reacq-stable-max-center-motion-frac", type=float, default=0.025)
+    parser.add_argument("--reacq-stable-max-area-ratio", type=float, default=1.18)
+    parser.add_argument("--reacq-stable-max-corner-motion-frac", type=float, default=0.035)
     parser.add_argument(
         "--discover-solve-cooldown-frames",
         type=int,
