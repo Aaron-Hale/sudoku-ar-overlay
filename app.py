@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from sudoku_ar_overlay.board_state import BoardSession, BoardStatus
+from sudoku_ar_overlay.board_identity import KnownBoardRegistry
 from sudoku_ar_overlay.config import OverlayConfig, TrackingConfig
 from sudoku_ar_overlay.flow_tracker import FlowHomographyTracker
 from sudoku_ar_overlay.grid_validation import validate_sudoku_grid_candidate, warp_candidate, evaluate_sudoku_grid_fit
@@ -522,6 +523,12 @@ def run_video_mode(args: argparse.Namespace) -> None:
         max_fit_error_px=args.fit_max_mean_error_px,
     )
 
+    known_boards = KnownBoardRegistry(
+        max_boards=args.known_board_max_items,
+        match_threshold=args.known_board_match_threshold,
+        size=args.known_board_fingerprint_size,
+    )
+
     loss_events = 0
     reacquisition_events = 0
     tracking_frames = 0
@@ -537,6 +544,27 @@ def run_video_mode(args: argparse.Namespace) -> None:
             return
         last_good_area_px = _quad_area_px(corners)
         last_good_center_px = _quad_center_px(corners)
+
+    def remember_known_board(frame, corners, frame_idx: int, label: str) -> None:
+        """Cache solved board identity so known puzzles can reacquire without OCR."""
+        if corners is None or session.givens is None or session.solution is None:
+            return
+
+        try:
+            board = known_boards.add(
+                frame_bgr=frame,
+                corners=corners,
+                givens=session.givens,
+                solution=session.solution,
+                frame_idx=frame_idx,
+                solve_latency_ms=session.solve_latency_ms,
+                label=label,
+            )
+            if args.debug:
+                print(f"Registered known board id={board.board_id} label={board.label}")
+        except Exception as exc:
+            if args.debug:
+                print(f"Known-board registration failed: {type(exc).__name__}: {exc}")
 
     def mark_lost(reason: str) -> None:
         """Hide overlay and preserve last good pose/session for possible same-board reacq."""
@@ -666,6 +694,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
             session.status = BoardStatus.SOLVED_TRACKING
             session.tracking_quality = 1.0
             remember_good_pose(init_result.corners)
+            remember_known_board(frame, init_result.corners, frame_idx, label)
             pending_candidate_corners = None
             pending_candidate_count = 0
             last_reason = f"{label}: solved and initialized flow"
@@ -720,6 +749,8 @@ def run_video_mode(args: argparse.Namespace) -> None:
                 session.status = BoardStatus.SOLVED_TRACKING
                 session.tracking_quality = 1.0
                 remember_good_pose(init_result.corners)
+                if args.register_discovery_solves_as_known:
+                    remember_known_board(frame, init_result.corners, frame_idx, label)
                 pending_candidate_corners = None
                 pending_candidate_count = 0
                 reacquisition_events += 1
@@ -767,6 +798,43 @@ def run_video_mode(args: argparse.Namespace) -> None:
         pending_candidate_corners = None
         pending_candidate_count = 0
         last_reason = f"same-pose cached reacq failed: {init_result.reason}"
+        return False
+
+    def reacquire_known_board(match, frame, corners, frame_idx: int, stability_reason: str) -> bool:
+        """Attach a previously solved known board without running OCR again."""
+        nonlocal solved, flow_ok, last_reason, reacquisition_events
+        nonlocal pending_candidate_corners, pending_candidate_count
+
+        known = match.known_board
+        if known is None:
+            return False
+
+        session.set_solved(
+            givens=known.givens,
+            solution=known.solution,
+            corners=corners,
+            frame_idx=frame_idx,
+            solve_latency_ms=known.solve_latency_ms,
+        )
+
+        init_result = flow.initialize(frame, corners)
+        if init_result.ok and init_result.corners is not None:
+            solved = True
+            flow_ok = True
+            session.smoothed_corners = init_result.corners
+            session.last_corners = init_result.corners
+            session.last_seen_frame_idx = frame_idx
+            session.status = BoardStatus.REACQUIRED
+            session.tracking_quality = 1.0
+            remember_good_pose(init_result.corners)
+            pending_candidate_corners = None
+            pending_candidate_count = 0
+            reacquisition_events += 1
+            last_reason = f"known-board reacq: {match.reason}; {stability_reason}"
+            return True
+
+        flow_ok = False
+        last_reason = f"known-board reacq flow init failed: {init_result.reason}; {match.reason}"
         return False
 
     def discover_candidate_and_maybe_solve(frame, frame_idx: int) -> None:
@@ -857,7 +925,20 @@ def run_video_mode(args: argparse.Namespace) -> None:
 
             stable_corners = stability.candidate.corners
 
-            # 4) Decide whether this is plausibly the same board location.
+            # 4) Prefer known-board identity over fresh OCR.
+            # This prevents a previously solved puzzle from being re-solved from a worse late-frame crop.
+            known_match = known_boards.match(frame, stable_corners)
+            if known_match.ok and reacquire_known_board(
+                known_match,
+                frame,
+                stable_corners,
+                frame_idx,
+                stability.reason,
+            ):
+                reacq_buffer.reset()
+                return
+
+            # 5) Decide whether this is plausibly the same board location.
             same_pose_likely = False
             pose_reason = "no last pose"
             if last_good_center_px is not None and last_good_area_px is not None and last_good_area_px > 1:
@@ -1196,6 +1277,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reacq-stable-max-center-motion-frac", type=float, default=0.025)
     parser.add_argument("--reacq-stable-max-area-ratio", type=float, default=1.18)
     parser.add_argument("--reacq-stable-max-corner-motion-frac", type=float, default=0.035)
+    parser.add_argument("--known-board-match-threshold", type=float, default=0.78)
+    parser.add_argument("--known-board-fingerprint-size", type=int, default=450)
+    parser.add_argument("--known-board-max-items", type=int, default=8)
+    parser.add_argument(
+        "--register-discovery-solves-as-known",
+        action="store_true",
+        help="If set, successful fresh discovery solves are added to the known-board registry. Default off to avoid caching wrong single-frame solves.",
+    )
     parser.add_argument(
         "--discover-solve-cooldown-frames",
         type=int,
