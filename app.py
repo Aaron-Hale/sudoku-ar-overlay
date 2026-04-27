@@ -20,6 +20,11 @@ from sudoku_ar_overlay.stabilizer import CornerStabilizer
 from sudoku_ar_overlay.tracking import score_corners
 
 
+
+def count_givens(givens) -> int:
+    return sum(1 for row in givens for value in row if int(value) != 0)
+
+
 def print_solver_result(result) -> None:
     print(f"Solver status: {result.status}")
     print(f"Solve latency: {result.solve_latency_ms:.2f} ms")
@@ -392,15 +397,27 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
 
 
 
+
+def _quad_area_px(corners) -> float:
+    return float(abs(cv2.contourArea(corners.reshape(-1, 1, 2).astype("float32"))))
+
+
+def _mean_corner_jump_px(current, previous) -> float:
+    if current is None or previous is None:
+        return 0.0
+    diff = current.astype("float32") - previous.astype("float32")
+    dists = ((diff ** 2).sum(axis=1) ** 0.5)
+    return float(dists.mean())
+
+
 def run_video_mode(args: argparse.Namespace) -> None:
     """Process a recorded video and write an annotated output video.
 
-    This version uses:
+    Uses:
     - solve once on --solve-frame
-    - initialize optical-flow homography tracker from solved corners
-    - update board corners every frame with optical flow
-    - hide overlay when flow confidence fails
-    - use segmentation only for reacquisition after tracking loss
+    - optical-flow homography tracking while confidence is good
+    - fail-closed behavior when tracking becomes implausible
+    - segmentation-only reacquisition after loss
     """
     if not args.input:
         raise ValueError("--input is required for video mode.")
@@ -429,11 +446,11 @@ def run_video_mode(args: argparse.Namespace) -> None:
     )
 
     flow = FlowHomographyTracker(
-        max_corners=getattr(args, "flow_max_corners", 600),
-        min_points=getattr(args, "flow_min_points", 18),
-        min_inlier_ratio=getattr(args, "flow_min_inlier_ratio", 0.45),
-        ransac_reproj_threshold=getattr(args, "flow_ransac_reproj_threshold", 4.0),
-        refresh_points_every=getattr(args, "flow_refresh_points_every", 5),
+        max_corners=args.flow_max_corners,
+        min_points=args.flow_min_points,
+        min_inlier_ratio=args.flow_min_inlier_ratio,
+        ransac_reproj_threshold=args.flow_ransac_reproj_threshold,
+        refresh_points_every=args.flow_refresh_points_every,
     )
 
     writer = None
@@ -448,6 +465,9 @@ def run_video_mode(args: argparse.Namespace) -> None:
     last_flow_points = 0
     last_flow_inliers = 0
     last_flow_ratio = 0.0
+    last_good_area_px = None
+    pending_reacq_corners = None
+    pending_reacq_count = 0
 
     loss_events = 0
     reacquisition_events = 0
@@ -455,6 +475,99 @@ def run_video_mode(args: argparse.Namespace) -> None:
     lost_frames = 0
 
     started = time.perf_counter()
+
+    def mark_lost(reason: str) -> None:
+        nonlocal flow_ok, last_reason, loss_events, last_good_area_px
+        nonlocal pending_reacq_corners, pending_reacq_count
+
+        flow_ok = False
+        last_reason = reason
+        flow.reset()
+
+        # Once tracking is lost, old board corners should not influence reacquisition.
+        # Keep the solved grid/session, but clear stale geometry.
+        session.last_corners = None
+        session.smoothed_corners = None
+        session.tracking_quality = 0.0
+        last_good_area_px = None
+        pending_reacq_corners = None
+        pending_reacq_count = 0
+
+        if session.status != BoardStatus.TRACKING_LOST:
+            loss_events += 1
+        session.status = BoardStatus.TRACKING_LOST
+
+    def validate_tracked_corners(corners, previous_corners, frame_shape) -> tuple[bool, str, float]:
+        nonlocal last_good_area_px
+
+        h, w = frame_shape[:2]
+        frame_area = float(h * w)
+        max_dim = float(max(h, w))
+
+        if corners is None:
+            return False, "no corners", 0.0
+
+        area = _quad_area_px(corners)
+
+        if area < frame_area * args.video_min_board_area_frac:
+            return False, f"board too small: area_frac={area / frame_area:.4f}", area
+
+        if last_good_area_px is not None and last_good_area_px > 1:
+            ratio = area / last_good_area_px
+            if ratio < args.video_min_area_change_ratio or ratio > args.video_max_area_change_ratio:
+                return False, f"area jump: ratio={ratio:.2f}", area
+
+        if previous_corners is not None:
+            jump = _mean_corner_jump_px(corners, previous_corners)
+            if jump > max_dim * args.video_max_corner_jump_frac:
+                return False, f"corner jump too large: {jump:.1f}px", area
+
+        scored = score_corners(
+            corners,
+            frame_shape=frame_shape,
+            previous_corners=previous_corners,
+        )
+
+        if not scored.detected or scored.corners is None:
+            return False, f"corner score failed: {scored.reason}", area
+
+        if scored.quality < args.video_min_score_quality:
+            return False, f"low corner quality: {scored.quality:.2f}", area
+
+        return True, "ok", area
+
+    def validate_reacq_candidate(corners, frame_shape):
+        """Validate segmentation output during reacquisition.
+
+        This creates the effective "no puzzle detected" path:
+        segmentation may return a best candidate, but we reject it unless
+        it looks like a plausible Sudoku board.
+        """
+        scored = score_corners(
+            corners,
+            frame_shape=frame_shape,
+            previous_corners=None,  # do not bias toward old lost position
+        )
+
+        if not scored.detected or scored.corners is None:
+            return False, f"reacq score failed: {scored.reason}", None, 0.0
+
+        h, w = frame_shape[:2]
+        frame_area = float(h * w)
+        area = _quad_area_px(scored.corners)
+        area_frac = area / frame_area if frame_area > 0 else 0.0
+
+        if area_frac < args.reacquire_min_board_area_frac:
+            return False, f"reacq too small: area_frac={area_frac:.4f}", None, area
+
+        if area_frac > args.reacquire_max_board_area_frac:
+            return False, f"reacq too large: area_frac={area_frac:.4f}", None, area
+
+        if scored.quality < args.reacquire_min_score_quality:
+            return False, f"reacq low quality: q={scored.quality:.2f}", None, area
+
+        return True, f"reacq candidate ok: q={scored.quality:.2f} area={area_frac:.3f}", scored.corners, area
+
 
     print(f"Reading video: {args.input}")
     print(f"Writing video: {out_path}")
@@ -477,9 +590,7 @@ def run_video_mode(args: argparse.Namespace) -> None:
             if not writer.isOpened():
                 raise RuntimeError(f"Could not open video writer: {out_path}")
 
-        previous_status = session.status
-
-        # Solve once on the requested frame and initialize optical-flow tracking.
+        # Solve once on selected frame and initialize flow tracker.
         if frame_idx == args.solve_frame and not solved:
             solved, last_error = solve_and_update_session(
                 frame=frame,
@@ -499,41 +610,112 @@ def run_video_mode(args: argparse.Namespace) -> None:
                     session.last_seen_frame_idx = frame_idx
                     session.status = BoardStatus.SOLVED_TRACKING
                     session.tracking_quality = 1.0
+                    last_good_area_px = _quad_area_px(init_result.corners)
+                    last_reason = f"flow initialized: {init_result.reason}"
                 else:
-                    session.status = BoardStatus.TRACKING_LOST
-                    last_reason = f"flow init failed: {init_result.reason}"
+                    mark_lost(f"flow init failed: {init_result.reason}")
 
-        # Fast optical-flow tracking after solve.
-        elif solved and flow.initialized:
+        # Fast per-frame optical-flow tracking while board is visible.
+        elif solved and flow.initialized and session.status != BoardStatus.TRACKING_LOST:
+            previous_corners = None if session.smoothed_corners is None else session.smoothed_corners.copy()
+
             t0 = time.perf_counter()
             flow_result = flow.update(frame)
             last_track_ms = (time.perf_counter() - t0) * 1000.0
 
-            last_reason = flow_result.reason
             last_flow_points = flow_result.num_points
             last_flow_inliers = flow_result.num_inliers
             last_flow_ratio = flow_result.inlier_ratio
 
             if flow_result.ok and flow_result.corners is not None:
-                flow_ok = True
-                session.smoothed_corners = flow_result.corners
-                session.last_corners = flow_result.corners
-                session.last_seen_frame_idx = frame_idx
-                session.tracking_quality = max(0.0, min(1.0, flow_result.inlier_ratio))
-                session.status = BoardStatus.SOLVED_TRACKING
-                tracking_frames += 1
+                gate_ok, gate_reason, area = validate_tracked_corners(
+                    flow_result.corners,
+                    previous_corners,
+                    frame.shape,
+                )
+
+                if gate_ok:
+                    flow_ok = True
+                    session.smoothed_corners = flow_result.corners
+                    session.last_corners = flow_result.corners
+                    session.last_seen_frame_idx = frame_idx
+                    session.tracking_quality = max(0.0, min(1.0, flow_result.inlier_ratio))
+                    session.status = BoardStatus.SOLVED_TRACKING
+                    last_good_area_px = area
+                    last_reason = flow_result.reason
+                    tracking_frames += 1
+                else:
+                    mark_lost(f"flow rejected: {gate_reason}")
+                    lost_frames += 1
             else:
-                flow_ok = False
-                flow.reset()
-                session.status = BoardStatus.TRACKING_LOST
+                mark_lost(f"flow failed: {flow_result.reason}")
                 lost_frames += 1
 
-        # Reacquire with slow segmentation only after tracking is lost.
+        # Segmentation-only reacquisition after tracking is lost.
+        # Important: segmentation candidates are treated as "proposals" only.
+        # We require repeated consistent proposals before reattaching the cached overlay.
         should_reacquire = (
             solved
             and session.status == BoardStatus.TRACKING_LOST
-            and frame_idx % max(getattr(args, "reacquire_every_n_frames", 15), 1) == 0
+            and frame_idx % max(args.reacquire_every_n_frames, 1) == 0
         )
+
+        if should_reacquire and args.reacquire_with_solve:
+            try:
+                print(f"Reacquisition solve attempt at frame {frame_idx}...")
+                result = solve_frame(
+                    frame,
+                    solver=args.solver,
+                    repo_root=args.repo_root,
+                )
+
+                givens_count = count_givens(result.givens)
+                if not (args.reacquire_min_givens <= givens_count <= args.reacquire_max_givens):
+                    flow_ok = False
+                    last_reason = (
+                        f"reacq solve rejected: givens_count={givens_count} "
+                        f"allowed=[{args.reacquire_min_givens},{args.reacquire_max_givens}]"
+                    )
+                else:
+                    session.set_solved(
+                        givens=result.givens,
+                        solution=result.solution,
+                        corners=result.corners,
+                        frame_idx=frame_idx,
+                        solve_latency_ms=result.solve_latency_ms,
+                    )
+
+                    init_result = flow.initialize(frame, result.corners)
+                    if init_result.ok and init_result.corners is not None:
+                        flow_ok = True
+                        session.smoothed_corners = init_result.corners
+                        session.last_corners = init_result.corners
+                        session.last_seen_frame_idx = frame_idx
+                        session.tracking_quality = 1.0
+                        session.status = BoardStatus.REACQUIRED
+                        last_good_area_px = _quad_area_px(init_result.corners)
+                        reacquisition_events += 1
+                        pending_reacq_corners = None
+                        pending_reacq_count = 0
+                        last_reason = (
+                            f"reacquired via fresh solve: givens={givens_count} "
+                            f"{init_result.reason}"
+                        )
+                    else:
+                        flow_ok = False
+                        session.status = BoardStatus.TRACKING_LOST
+                        session.last_corners = None
+                        session.smoothed_corners = None
+                        last_reason = f"reacq solve ok but flow init failed: {init_result.reason}"
+
+            except Exception as exc:
+                flow_ok = False
+                session.status = BoardStatus.TRACKING_LOST
+                session.last_corners = None
+                session.smoothed_corners = None
+                last_reason = f"reacq solve failed: {type(exc).__name__}: {exc}"
+
+            should_reacquire = False
 
         if should_reacquire:
             try:
@@ -547,39 +729,68 @@ def run_video_mode(args: argparse.Namespace) -> None:
                     (time.perf_counter() - t0) * 1000.0,
                 )
 
-                scored = score_corners(
+                cand_ok, cand_reason, cand_corners, cand_area = validate_reacq_candidate(
                     corners,
-                    frame_shape=frame.shape,
-                    previous_corners=session.smoothed_corners,
+                    frame.shape,
                 )
 
-                if scored.detected and scored.corners is not None:
-                    init_result = flow.initialize(frame, scored.corners)
-
-                    if init_result.ok and init_result.corners is not None:
-                        flow_ok = True
-                        session.smoothed_corners = init_result.corners
-                        session.last_corners = init_result.corners
-                        session.last_seen_frame_idx = frame_idx
-                        session.tracking_quality = scored.quality
-                        session.status = BoardStatus.REACQUIRED
-                        last_reason = f"reacquired: {init_result.reason}"
-                    else:
-                        flow_ok = False
-                        last_reason = f"reacq flow init failed: {init_result.reason}"
-                else:
+                if not cand_ok or cand_corners is None:
+                    pending_reacq_corners = None
+                    pending_reacq_count = 0
                     flow_ok = False
-                    last_reason = f"reacq detect failed: {scored.reason}"
+                    last_reason = cand_reason
+                else:
+                    if pending_reacq_corners is None:
+                        pending_reacq_corners = cand_corners.copy()
+                        pending_reacq_count = 1
+                        flow_ok = False
+                        last_reason = (
+                            f"reacq pending {pending_reacq_count}/"
+                            f"{args.reacquire_confirm_frames}: {cand_reason}"
+                        )
+                    else:
+                        shift = _mean_corner_jump_px(cand_corners, pending_reacq_corners)
+                        max_dim = float(max(frame.shape[:2]))
+
+                        if shift <= max_dim * args.reacquire_max_candidate_shift_frac:
+                            pending_reacq_corners = cand_corners.copy()
+                            pending_reacq_count += 1
+                            last_reason = (
+                                f"reacq pending {pending_reacq_count}/"
+                                f"{args.reacquire_confirm_frames}: shift={shift:.1f}px"
+                            )
+                        else:
+                            pending_reacq_corners = cand_corners.copy()
+                            pending_reacq_count = 1
+                            flow_ok = False
+                            last_reason = f"reacq candidate moved/reset: shift={shift:.1f}px"
+
+                    if pending_reacq_count >= args.reacquire_confirm_frames:
+                        init_result = flow.initialize(frame, pending_reacq_corners)
+
+                        if init_result.ok and init_result.corners is not None:
+                            flow_ok = True
+                            session.smoothed_corners = init_result.corners
+                            session.last_corners = init_result.corners
+                            session.last_seen_frame_idx = frame_idx
+                            session.tracking_quality = 1.0
+                            session.status = BoardStatus.REACQUIRED
+                            last_good_area_px = _quad_area_px(init_result.corners)
+                            pending_reacq_corners = None
+                            pending_reacq_count = 0
+                            reacquisition_events += 1
+                            last_reason = f"reacquired: {init_result.reason}"
+                        else:
+                            flow_ok = False
+                            pending_reacq_corners = None
+                            pending_reacq_count = 0
+                            last_reason = f"reacq flow init failed: {init_result.reason}"
 
             except Exception as exc:
                 flow_ok = False
+                pending_reacq_corners = None
+                pending_reacq_count = 0
                 last_reason = f"reacq failed: {type(exc).__name__}: {exc}"
-
-        if session.status == BoardStatus.TRACKING_LOST and previous_status != BoardStatus.TRACKING_LOST:
-            loss_events += 1
-
-        if session.status == BoardStatus.REACQUIRED and previous_status == BoardStatus.TRACKING_LOST:
-            reacquisition_events += 1
 
         display = frame.copy()
 
@@ -726,12 +937,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-min-inlier-ratio", type=float, default=0.45)
     parser.add_argument("--flow-ransac-reproj-threshold", type=float, default=4.0)
     parser.add_argument("--flow-refresh-points-every", type=int, default=5)
+    parser.add_argument("--video-min-board-area-frac", type=float, default=0.025)
+    parser.add_argument("--video-min-area-change-ratio", type=float, default=0.45)
+    parser.add_argument("--video-max-area-change-ratio", type=float, default=2.20)
+    parser.add_argument("--video-max-corner-jump-frac", type=float, default=0.35)
+    parser.add_argument("--video-min-score-quality", type=float, default=0.25)
     parser.add_argument(
         "--reacquire-every-n-frames",
         type=int,
         default=15,
         help="When tracking is lost in video mode, try segmentation reacquisition every N frames.",
     )
+    parser.add_argument(
+        "--reacquire-with-solve",
+        action="store_true",
+        default=False,
+        help="After tracking loss, require a fresh solve before reattaching any overlay.",
+    )
+    parser.add_argument(
+        "--reacquire-min-givens",
+        type=int,
+        default=10,
+        help="Reject reacquisition solves with too few detected givens.",
+    )
+    parser.add_argument(
+        "--reacquire-max-givens",
+        type=int,
+        default=55,
+        help="Reject reacquisition solves with too many detected givens.",
+    )
+    parser.add_argument(
+        "--reacquire-confirm-frames",
+        type=int,
+        default=2,
+        help="Require this many consecutive credible detections before reacquiring.",
+    )
+    parser.add_argument("--reacquire-min-score-quality", type=float, default=0.45)
+    parser.add_argument("--reacquire-min-board-area-frac", type=float, default=0.025)
+    parser.add_argument("--reacquire-max-board-area-frac", type=float, default=0.80)
+    parser.add_argument("--reacquire-max-candidate-shift-frac", type=float, default=0.18)
 
     parser.add_argument(
         "--debug",
