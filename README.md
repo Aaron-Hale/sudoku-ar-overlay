@@ -10,13 +10,7 @@
 **Debug / stress demo:**  
 [Watch `processed_iphone_aggressive_known_board_identity.mp4`](https://github.com/Aaron-Hale/sudoku-ar-overlay/releases/download/markerless-video-demo-v1/processed_iphone_aggressive_known_board_identity.mp4)
 
-A markerless, recorded-video planar AR-style overlay for Sudoku solving.
-
-This project extends [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) from a static image inference pipeline into a video perception system. It solves a Sudoku puzzle from a clean frame, projects the missing answers onto the board plane, tracks the board with optical-flow homography, hides the overlay when tracking confidence drops, and reacquires known boards using grid refinement, stability gating, and board identity caching.
-
-> This is **not** visual odometry, SLAM, ARKit, or ARCore. It is a bounded planar tracking system for a flat object.
-
----
+The demo videos are generated artifacts and are intentionally ignored by Git. The small GIF preview above is committed for quick README viewing; full MP4s are published through the GitHub Release.
 
 ## Demo
 
