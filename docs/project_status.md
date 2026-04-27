@@ -744,3 +744,627 @@ AR-style planar overlay demo
 As of now:
 
 > `sudoku-ar-overlay` has a working local repo, real solver integration, static image overlay through `app.py`, a functioning webcam feed, and manual webcam solving. The next major task is live planar board tracking so the solved overlay follows the Sudoku board across frames instead of staying tied to the frame captured when the user pressed solve.
+
+
+
+## 17. Update — Segmentation Tracking Test and Next Architecture Decision
+
+**Date:** 2026-04-24  
+**Branch during this work:** planar-tracking
+
+### 17.1 What was added
+
+After the manual webcam solve flow worked, the project moved into live planar tracking.
+
+The following tracking-related pieces were added or tested:
+
+- `src/sudoku_ar_overlay/tracking.py`
+- `src/sudoku_ar_overlay/stabilizer.py`
+- segmentation-only board-corner detection in `solver_adapter.py`
+- tracking-related flags in `app.py`
+
+The goal was to avoid running full OCR and Sudoku solving every frame. Instead, the app now attempts to run segmentation-only board detection every few frames, update the board corners, smooth/stabilize those corners, and render the cached solved overlay on the current board plane.
+
+### 17.2 Confirmed working behavior
+
+The following behavior is confirmed:
+
+- static image mode works
+- webcam mode opens
+- manual webcam solve works
+- real solver integration works
+- segmentation-only tracking can detect and outline the board
+- solved overlay can render using tracked board corners
+
+Representative image-mode command:
+
+    PYTHONPATH=src python app.py \
+      --mode image \
+      --solver real \
+      --repo-root "$HOME/projects/sudoku-image-solver" \
+      --image "$HOME/Desktop/sudoku_solver/data/raw/core_test/cte_0022.jpg" \
+      --out assets/demo/app_static_real_overlay.jpg
+
+Representative webcam tracking command tested:
+
+    PYTHONPATH=src python app.py \
+      --mode webcam \
+      --solver real \
+      --repo-root "$HOME/projects/sudoku-image-solver" \
+      --track-board \
+      --track-every-n-frames 5 \
+      --lost-after-tracking-attempts 3 \
+      --stabilizer-median-window 3 \
+      --stabilizer-static-alpha 0.10 \
+      --stabilizer-moving-alpha 0.99 \
+      --stabilizer-static-motion-px 5 \
+      --stabilizer-fast-motion-px 10 \
+      --debug
+
+### 17.3 Key finding
+
+Segmentation-only tracking works conceptually, but it is too slow to feel like smooth AR when the board or camera moves.
+
+Observed problem:
+
+- the board outline and overlay lag behind the physical puzzle during movement
+- increasing stabilizer responsiveness helps, but does not remove the lag
+- high responsiveness settings reduce smoothing benefits and make jitter more visible
+
+The main issue is architectural:
+
+> The segmentation model is being used as both the detector and the tracker.
+
+Segmentation is useful for finding or reacquiring the board, but it is too slow to serve as the per-frame AR tracker.
+
+### 17.4 Stabilizer lesson
+
+The stabilizer clarified the tradeoff:
+
+- more smoothing reduces jitter but increases lag
+- less smoothing improves responsiveness but increases jitter
+- high moving-alpha values mostly trust raw detections
+- remaining lag is mostly caused by slow segmentation inference, not smoothing alone
+
+This means parameter tuning alone is unlikely to make the overlay feel truly AR-like.
+
+### 17.5 Updated architecture decision
+
+The next architecture should separate slow absolute detection from fast frame-to-frame tracking.
+
+The new intended loop is:
+
+1. Segmentation detects board corners.
+2. A fast tracker initializes on the board region.
+3. Every camera frame:
+   - track feature points with optical flow
+   - estimate homography
+   - update board corners
+   - render overlay
+4. Every N frames:
+   - segmentation refreshes or corrects the tracker
+5. If tracking fails:
+   - hide overlay
+   - wait for segmentation reacquisition
+
+Updated component roles:
+
+| Component | Purpose | Expected speed |
+|---|---|---:|
+| Segmentation | absolute board detection and reacquisition | slow |
+| Optical flow plus homography | frame-to-frame board tracking | fast |
+| Stabilizer | reduce corner jitter | fast |
+| Session state | retain solved board and missing-cell mask | constant |
+| Overlay renderer | warp cached solution to current board plane | fast |
+
+### 17.6 Next technical milestone
+
+Add:
+
+- `src/sudoku_ar_overlay/flow_tracker.py`
+
+Expected OpenCV techniques:
+
+- `cv2.goodFeaturesToTrack`
+- `cv2.calcOpticalFlowPyrLK`
+- `cv2.findHomography` with RANSAC
+- `cv2.perspectiveTransform`
+
+Target behavior:
+
+- segmentation finds the board once
+- optical flow tracks board motion every frame
+- overlay follows the board with less lag
+- segmentation occasionally corrects drift
+- if the board leaves frame, tracking is lost
+- if the board returns, segmentation reacquires it
+
+### 17.7 Revised roadmap status
+
+| Phase | Status | Notes |
+|---|---|---|
+| Phase 0 — Repo setup and adapter | Done | Real solver bridge works |
+| Phase 1 — Static AR overlay | Done | Static image overlay works |
+| Phase 2 — Webcam/video loop | Mostly done | Webcam works; video-file mode still not built |
+| Phase 3 — Solve-once session state | Mostly done | Cached solution persists after solve |
+| Phase 4 — Homography-based planar tracking | Partially done | Segmentation-only tracking works but is too slow for smooth motion |
+| Phase 5 — Temporal smoothing and reacquisition | Partially started | Stabilizer exists, but full tracking stack needs optical flow |
+| Phase 6 — Metrics and demo artifacts | Not done | Needs metrics after tracking architecture improves |
+| Phase 7 — README polish | Not done | Wait until tracking design stabilizes |
+| Phase 8 — Pose estimation | Not started | Optional |
+| Phase 9 — ARKit/ARCore bridge | Not started | Optional |
+
+### 17.8 Current interpretation
+
+This is not a project failure. It is a useful engineering discovery.
+
+The current conclusion is:
+
+> A slow ML segmentation model can initialize and reacquire the board, but it should not be the per-frame AR tracker.
+
+Next step:
+
+> Add fast optical-flow/homography tracking between segmentation detections.
+
+
+
+---
+
+## 18. Update — Pivot to ArUco-Assisted Reliable Tracking
+
+**Date:** 2026-04-24  
+**Current branch:** aruco-assisted-tracking
+
+### 18.1 Current repo state
+
+The markerless tracking work has been committed and merged back into `main`.
+
+Known recent commits:
+
+- `48bd61f` — Add markerless flow tracking prototype and revise roadmap
+- `738480d` — Use OpenCV contrib for ArUco support
+- `98bdea3` — Restore OpenCV dependency after contrib import issue
+
+The active branch is now:
+
+    aruco-assisted-tracking
+
+This branch was created after merging the markerless tracking prototype into `main`.
+
+### 18.2 Markerless tracking conclusion
+
+The markerless pipeline now works as a proof-of-concept:
+
+- segmentation can initialize board corners
+- optical flow plus homography can track the board frame-to-frame
+- solved overlays can follow the board when movement is very slow
+- rendered video output can be recorded directly from the OpenCV app
+
+However, testing showed that markerless optical-flow tracking breaks under normal hand/camera movement.
+
+Observed behavior:
+
+- very slow movement works reasonably well
+- normal-speed motion causes drift, incorrect corners, or tracking loss
+- the overlay can become visibly detached from the puzzle
+- reacquisition is slower than desired because it depends on segmentation
+
+Conclusion:
+
+> Markerless tracking is useful as an experimental/technical mode, but it is not robust enough to be the final polished demo path.
+
+### 18.3 Architecture decision
+
+The project is pivoting to a two-mode tracking architecture:
+
+| Mode | Purpose | Status |
+|---|---|---|
+| Markerless mode | Demonstrates ML segmentation, optical flow, homography tracking, and known limitations | Prototype built |
+| ArUco-assisted mode | Provides reliable planar anchoring for the final demo | Starting now |
+
+This is a deliberate engineering choice.
+
+The final project should not pretend the markerless tracker is more robust than it is. Instead, the repo should show practical judgment:
+
+> Markerless tracking is technically interesting but fragile. Fiducial-assisted tracking gives a reliable AR anchor and a cleaner demo while staying fully in Python/OpenCV.
+
+### 18.4 Revised scope decision
+
+ARKit / ARCore implementation has been cut from the active project scope.
+
+Reason:
+
+- ARKit is mainly valuable when building an iPhone/iPad/Apple AR app with device motion tracking and native AR anchors.
+- This repo is a Python/OpenCV webcam project.
+- Adding ARKit would require a separate mobile/native app path and would distract from finishing the portfolio repo.
+
+ORB-SLAM is also not being added.
+
+Reason:
+
+- ORB-SLAM solves camera/world localization, not direct Sudoku board anchoring.
+- It would introduce substantial build, calibration, and integration complexity.
+- It is likely to become a time sink relative to the project goal.
+
+New direction:
+
+> Stay in Python/OpenCV. Use ArUco-assisted planar tracking as the reliable final demo path. Optionally add `solvePnP` pose/debug visualization later for credibility.
+
+### 18.5 Contract update
+
+The roadmap contract was revised to reflect the new direction:
+
+- markerless tracking remains as an experimental mode
+- ArUco-assisted tracking becomes the reliable demo path
+- ARKit / ARCore / ORB-SLAM are cut from implementation scope
+- optional pose estimation remains in scope through OpenCV `solvePnP`
+- final demo should prioritize reliability, clear metrics, and honest limitations
+
+The revised contract is stored at:
+
+    docs/ROADMAP_CONTRACT.md
+
+### 18.6 Dependency issue and resolution
+
+An attempt was made to switch from `opencv-python` to `opencv-contrib-python` for ArUco support.
+
+That caused a `cv2` import failure:
+
+    Library not loaded: @loader_path/.dylibs/libtesseract.5.dylib
+
+Resolution:
+
+- uninstall `opencv-contrib-python`
+- reinstall regular `opencv-python`
+- verify that regular OpenCV already includes ArUco support in this environment
+
+Successful validation output:
+
+    cv2 version: 4.13.0
+    aruco available: True
+    ArucoDetector available: True
+    DICT_4X4_50 available: True
+
+The dependency was restored in `pyproject.toml`:
+
+    "opencv-python>=4.8"
+
+This means no OpenCV contrib package is needed for the current ArUco plan.
+
+### 18.7 Current implementation status
+
+Completed:
+
+- static real solver overlay
+- webcam manual solve
+- freeze-frame solve usability
+- segmentation-only tracking prototype
+- adaptive stabilizer prototype
+- optical-flow homography tracker prototype
+- rendered video recording from OpenCV output
+- revised roadmap contract
+- OpenCV ArUco availability confirmed
+
+Not yet completed:
+
+- ArUco marker generation script
+- ArUco marker detection demo
+- ArUco-assisted Sudoku board anchor
+- ArUco-assisted solved overlay
+- final tracking-mode integration into `app.py`
+- README update for two-mode tracking
+- metrics documentation
+- polished demo video/GIF
+
+### 18.8 Immediate next step
+
+Next implementation milestone:
+
+> Generate a printable ArUco marker and prove webcam detection works.
+
+Files to add next:
+
+- `scripts/generate_aruco_marker.py`
+- `src/sudoku_ar_overlay/aruco_tracker.py`
+- `scripts/aruco_marker_demo.py`
+
+First target behavior:
+
+1. Generate marker ID 23.
+2. Open or print the marker sheet.
+3. Show the marker to the webcam.
+4. Detect the marker every frame.
+5. Draw marker outline, center, and ID.
+6. Optionally record the rendered output.
+
+Representative target commands:
+
+    PYTHONPATH=src python scripts/generate_aruco_marker.py \
+      --marker-id 23 \
+      --out assets/markers/aruco_23.png \
+      --sheet-out assets/markers/aruco_23_sheet.png
+
+    open assets/markers/aruco_23_sheet.png
+
+    PYTHONPATH=src python scripts/aruco_marker_demo.py \
+      --marker-id 23 \
+      --record-out assets/demo/aruco_marker_demo.mp4
+
+### 18.9 Next milestone after marker detection
+
+After basic marker detection works, the next step is to use the marker as a board anchor.
+
+Initial target:
+
+> Use one ArUco marker next to the Sudoku board with a known offset to estimate the Sudoku board plane.
+
+Later target:
+
+> Use four ArUco markers around the board for a more stable final demo.
+
+Recommended final tracking modes:
+
+| Tracking mode | Description |
+|---|---|
+| Markerless experimental | ML segmentation plus optical-flow homography tracking |
+| ArUco-assisted reliable | Fiducial-assisted board anchoring for stable final demo |
+
+### 18.10 Current interpretation
+
+The project has made an important design turn.
+
+The markerless mode is still valuable, but the reliable final demo should be ArUco-assisted.
+
+This gives the strongest portfolio story:
+
+> I built the markerless version, identified its limits under normal motion, and added a fiducial-assisted mode to produce a robust AR-style overlay while keeping the architecture bounded, practical, and honest.
+
+---
+
+## 19. Update — Final 3-Week Direction: Markerless Recorded-Video Demo
+
+**Date:** 2026-04-24  
+**Current working context:** Post-ArUco reconsideration  
+**Recommended next branch:** `markerless-video-demo`
+
+### 19.1 Why this update exists
+
+After further review, the ArUco-assisted direction was rejected as the final product/demo path.
+
+Reason:
+
+> A real end user should not need a printed fiducial marker, QR code, ArUco tag, AprilTag, or other artificial marker for the Sudoku overlay to work.
+
+ArUco remains useful as a diagnostic or internal calibration concept, but it should not be part of the user-facing demo or the main portfolio story.
+
+This section supersedes the ArUco final-demo direction described in Section 18.
+
+### 19.2 Current best project goal
+
+The best 3-week Anduril-facing portfolio goal is now:
+
+> Build a markerless, recorded-iPhone-video Sudoku AR overlay system with confidence-gated tracking and look-away/look-back reacquisition.
+
+The project should show that a frozen ML/CV model can be turned into a product-like video perception system:
+
+1. Detect a normal Sudoku puzzle.
+2. Solve it once.
+3. Cache the solved board state.
+4. Project missing digits onto the board plane.
+5. Track/render while confidence is high.
+6. Hide the overlay when tracking confidence drops.
+7. Reacquire the board when it returns.
+8. Report metrics and failure modes.
+
+### 19.3 Why recorded iPhone video is now the primary demo path
+
+Live USB webcam tracking proved too fragile under normal handheld motion.
+
+Recorded iPhone video is a better primary demo input because it offers:
+
+- higher resolution,
+- better exposure and focus,
+- less noise,
+- better motion handling,
+- repeatable test clips,
+- easier debugging,
+- easier metrics generation,
+- and cleaner final demo assets.
+
+The webcam path remains useful as a secondary live/experimental mode, but it should not define the quality bar for the final portfolio demo.
+
+### 19.4 What has already been learned
+
+The project has already tested several approaches:
+
+| Approach | Result | Decision |
+|---|---|---|
+| Static image overlay | Works | Keep |
+| Webcam manual solve | Works but clunky | Keep as secondary |
+| Segmentation-only tracking | Detects board but too slow/laggy | Not enough |
+| Corner stabilizer | Helps explain jitter/lag tradeoff | Keep ideas, not sufficient alone |
+| Optical-flow homography tracking | Better; works under very slow movement | Keep as experimental component |
+| ArUco-assisted tracking | Technically robust but product-inappropriate | Cut from final path |
+| Gridline-only tracking | Risky because inner lines can disappear | Do not use as primary anchor |
+| SLAM / ARKit | Too large for 3-week repo goal | Cut from active scope |
+
+### 19.5 Final architecture direction
+
+The final user-facing path should be:
+
+> Markerless template-assisted planar tracking from recorded iPhone video.
+
+High-level pipeline:
+
+1. Read iPhone video frame-by-frame.
+2. Detect Sudoku board using the existing segmentation/solver pipeline.
+3. Solve once on a clean frame.
+4. Cache:
+   - givens grid,
+   - solved grid,
+   - missing-cell mask,
+   - canonical board crop/template,
+   - last reliable board homography.
+5. Track board motion using optical flow and/or template-assisted homography.
+6. Optionally refine with visible grid/border cues when available.
+7. Render solved digits onto the board plane.
+8. Hide overlay when tracking confidence drops.
+9. Reacquire when the board returns to view.
+10. Write processed MP4 and metrics.
+
+### 19.6 Look-away / look-back definition
+
+The project should support look-away/look-back behavior, but it should be defined correctly.
+
+Out of scope:
+
+> Persistent 3D world-space anchoring while the board is completely off camera.
+
+That would require ARKit/ARCore/VIO/SLAM-style tracking and is not part of the 3-week goal.
+
+In scope:
+
+> Cache the solved board state, hide the overlay when tracking is lost, detect the board again when it returns, and reattach the cached solved overlay.
+
+Expected behavior:
+
+1. Board visible.
+2. System detects and solves board.
+3. Overlay appears.
+4. Camera looks away or board leaves frame.
+5. State becomes `TRACKING_LOST`.
+6. Overlay disappears.
+7. Camera looks back.
+8. Board is detected/reacquired.
+9. State becomes `REACQUIRED`.
+10. Cached solution appears again.
+
+This is product-credible and achievable.
+
+### 19.7 What should be cut from the active 3-week plan
+
+Do not pursue these as implementation goals for the current portfolio deadline:
+
+- ORB-SLAM integration,
+- ARKit/ARCore implementation,
+- ArUco/AprilTag/fiducial marker product path,
+- bent-paper deformation,
+- perfect fast-motion tracking,
+- consumer-grade live webcam robustness,
+- full mobile-native app.
+
+These can be mentioned as future work or rejected alternatives, but they should not block the repo.
+
+### 19.8 What should remain in scope
+
+Keep the project focused on:
+
+- static image overlay,
+- recorded-video processing mode,
+- iPhone video as primary demo input,
+- webcam as secondary experimental mode,
+- solve-once session state,
+- homography-based rendering,
+- markerless optical-flow/template tracking,
+- confidence-gated overlay rendering,
+- tracking-loss state,
+- look-away/look-back reacquisition,
+- metrics and demo assets,
+- README architecture polish.
+
+### 19.9 Recommended next implementation milestone
+
+The next technical milestone should be recorded-video mode:
+
+Target command:
+
+    PYTHONPATH=src python app.py \
+      --mode video \
+      --solver real \
+      --repo-root "$HOME/projects/sudoku-image-solver" \
+      --input assets/demo/raw_iphone_lookaway.mp4 \
+      --out assets/demo/processed_lookaway_overlay.mp4
+
+Expected first pass:
+
+1. Read a video file.
+2. Let the user specify or auto-select a solve frame.
+3. Solve once.
+4. Render overlay across subsequent frames.
+5. Hide overlay when tracking confidence is too low.
+6. Save processed output video.
+7. Print basic metrics.
+
+### 19.10 Three-week build plan
+
+#### Week 1 — Recorded-video foundation
+
+Build:
+
+- `--mode video`
+- direct MP4 output
+- solve-once video session
+- overlay rendering across frames
+- tracking confidence score
+- hide overlay on tracking loss
+
+Pass condition:
+
+> One iPhone video produces a processed overlay video where the overlay looks good under controlled moderate motion and disappears instead of drifting when tracking fails.
+
+#### Week 2 — Reacquisition and template-assisted tracking
+
+Build:
+
+- canonical board template after solve,
+- template/feature-assisted reacquisition,
+- session-level same-board assumption,
+- optional board fingerprint from givens/template,
+- look-away/look-back clip support,
+- tracking-loss and reacquisition metrics.
+
+Pass condition:
+
+> Camera can look away, return to the board, and the cached solved overlay reappears.
+
+#### Week 3 — Portfolio polish
+
+Build:
+
+- `assets/demo/final_demo.mp4`
+- `assets/demo/debug_demo.mp4`
+- `docs/metrics.md`
+- README architecture diagram
+- README demo section
+- README limitations section
+- concise Anduril-facing technical narrative
+
+Pass condition:
+
+> A reviewer can understand the system, watch the demo, see metrics, and understand the engineering tradeoffs in under two minutes.
+
+### 19.11 Confidence assessment
+
+Current confidence:
+
+| Goal | Confidence | Notes |
+|---|---:|---|
+| Static overlay | High | Already works |
+| Recorded-video processing | High | Straightforward OpenCV video IO |
+| Solve-once video session | High | Existing solver/session work supports this |
+| Moderate-motion overlay on iPhone video | Medium-high | Better input quality should help |
+| Look-away/look-back reacquisition | High under controlled video | Easier than continuous fast tracking |
+| Template-assisted tracking improvement | Medium | Useful, but not magic |
+| Robust live webcam under normal motion | Low | Not the primary target |
+| Full SLAM/ARKit-style persistence | Low within 3 weeks | Cut from scope |
+
+### 19.12 Final interpretation
+
+The right portfolio piece is not a perfect AR product.
+
+The right portfolio piece is:
+
+> A markerless video perception system that turns a frozen Sudoku solver into an AR-style overlay demo with solve-once inference, planar homography rendering, confidence-gated tracking, look-away/look-back reacquisition, and clear metrics.
+
+This is the most credible and shippable 3-week plan for an MLE-oriented portfolio project.
+
