@@ -8,3 +8,7 @@ assets/demo/*.avi
 assets/demo/*.gif
 assets/demo/*.jpg
 assets/demo/*.png
+
+# Python packaging metadata
+*.egg-info/
+src/*.egg-info/

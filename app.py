@@ -15,6 +15,7 @@ from sudoku_ar_overlay.solver_adapter import (
     load_image_bgr,
     solve_frame,
 )
+from sudoku_ar_overlay.stabilizer import CornerStabilizer
 from sudoku_ar_overlay.tracking import score_corners
 
 
@@ -113,9 +114,9 @@ def update_board_tracking(
     session: BoardSession,
     args: argparse.Namespace,
     frame_idx: int,
-    tracking_cfg: TrackingConfig,
-) -> tuple[bool, str, float]:
-    """Detect board corners only, smooth them, and update session tracking state."""
+    stabilizer: CornerStabilizer,
+) -> tuple[bool, str, float, float, float]:
+    """Detect board corners only, stabilize them, and update session tracking state."""
     try:
         corners, timing = detect_board_corners_only(
             frame,
@@ -129,16 +130,25 @@ def update_board_tracking(
         )
 
         if not scored.detected or scored.corners is None:
-            return False, scored.reason, timing.get("segmentation_ms", 0.0)
+            return False, scored.reason, timing.get("segmentation_ms", 0.0), 0.0, 0.0
 
-        smoothed = smooth_corners(
-            session.smoothed_corners,
-            scored.corners,
-            alpha=tracking_cfg.smoothing_alpha,
+        stabilized = stabilizer.update(
+            detected_corners=scored.corners,
+            quality=scored.quality,
+            frame_shape=frame.shape,
         )
 
+        if not stabilized.accepted or stabilized.corners is None:
+            return (
+                False,
+                stabilized.reason,
+                timing.get("segmentation_ms", 0.0),
+                stabilized.alpha_used,
+                stabilized.mean_motion_px,
+            )
+
         session.last_corners = scored.corners
-        session.smoothed_corners = smoothed
+        session.smoothed_corners = stabilized.corners
         session.last_seen_frame_idx = frame_idx
         session.tracking_quality = scored.quality
 
@@ -150,10 +160,16 @@ def update_board_tracking(
         else:
             session.status = BoardStatus.BOARD_DETECTED
 
-        return True, scored.reason, timing.get("segmentation_ms", 0.0)
+        return (
+            True,
+            stabilized.reason,
+            timing.get("segmentation_ms", 0.0),
+            stabilized.alpha_used,
+            stabilized.mean_motion_px,
+        )
 
     except Exception as exc:
-        return False, f"track failed: {type(exc).__name__}: {exc}", 0.0
+        return False, f"track failed: {type(exc).__name__}: {exc}", 0.0, 0.0, 0.0
 
 
 def run_webcam_mode(args: argparse.Namespace) -> None:
@@ -169,10 +185,22 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
         detection_every_n_frames=args.track_every_n_frames,
     )
 
+    stabilizer = CornerStabilizer(
+        median_window=args.stabilizer_median_window,
+        min_quality=args.stabilizer_min_quality,
+        static_alpha=args.stabilizer_static_alpha,
+        moving_alpha=args.stabilizer_moving_alpha,
+        static_motion_px=args.stabilizer_static_motion_px,
+        fast_motion_px=args.stabilizer_fast_motion_px,
+        max_jump_ratio=args.stabilizer_max_jump_ratio,
+    )
+
     frame_idx = 0
     tracking_attempts_since_seen = 0
     last_track_ms = 0.0
     last_track_reason = ""
+    last_stabilizer_alpha = 0.0
+    last_mean_motion_px = 0.0
 
     last_fps_time = time.perf_counter()
     fps = 0.0
@@ -217,15 +245,17 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
             )
 
         if should_track_this_frame:
-            detected, reason, track_ms = update_board_tracking(
+            detected, reason, track_ms, stab_alpha, mean_motion_px = update_board_tracking(
                 frame=frame_for_solve,
                 session=session,
                 args=args,
                 frame_idx=frame_idx,
-                tracking_cfg=tracking_cfg,
+                stabilizer=stabilizer,
             )
             last_track_ms = track_ms
             last_track_reason = reason
+            last_stabilizer_alpha = stab_alpha
+            last_mean_motion_px = mean_motion_px
 
             if detected:
                 tracking_attempts_since_seen = 0
@@ -243,7 +273,6 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
 
         display = frame_for_display.copy()
 
-        # Draw board outline before solving if tracking has corners.
         if (
             session.solution is None
             and session.smoothed_corners is not None
@@ -251,7 +280,6 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
         ):
             display = draw_board_outline(display, session.smoothed_corners)
 
-        # Draw solved overlay if solved and currently tracked/reacquired.
         if (
             session.status in {BoardStatus.SOLVED_TRACKING, BoardStatus.REACQUIRED}
             and session.givens is not None
@@ -275,7 +303,6 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
             fps = 0.95 * fps + 0.05 * (1.0 / dt) if fps > 0 else 1.0 / dt
         last_fps_time = now
 
-        # Optional auto-solve. Only attempt while unsolved.
         if (
             auto_solve_enabled
             and session.status != BoardStatus.SOLVED_TRACKING
@@ -298,7 +325,8 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
             ),
             (
                 f"track={args.track_board} every={args.track_every_n_frames} "
-                f"f/space freeze={frozen} | s solve | a auto={auto_solve_enabled} | r reset | q quit"
+                f"stab_a={last_stabilizer_alpha:.2f} motion={last_mean_motion_px:.1f}px "
+                f"| s solve | r reset | q quit"
             ),
         ]
 
@@ -325,6 +353,7 @@ def run_webcam_mode(args: argparse.Namespace) -> None:
 
         if key == ord("r"):
             session.reset()
+            stabilizer.reset()
             tracking_attempts_since_seen = 0
             last_error = ""
             last_track_reason = ""
@@ -423,13 +452,21 @@ def parse_args() -> argparse.Namespace:
         "--smoothing-alpha",
         type=float,
         default=0.25,
-        help="Corner smoothing alpha. Higher follows motion faster; lower reduces jitter.",
+        help="Legacy solve-time corner smoothing alpha.",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Show extra tracking debug text.",
     )
+
+    parser.add_argument("--stabilizer-median-window", type=int, default=5)
+    parser.add_argument("--stabilizer-min-quality", type=float, default=0.30)
+    parser.add_argument("--stabilizer-static-alpha", type=float, default=0.12)
+    parser.add_argument("--stabilizer-moving-alpha", type=float, default=0.55)
+    parser.add_argument("--stabilizer-static-motion-px", type=float, default=5.0)
+    parser.add_argument("--stabilizer-fast-motion-px", type=float, default=45.0)
+    parser.add_argument("--stabilizer-max-jump-ratio", type=float, default=0.25)
 
     return parser.parse_args()
 
