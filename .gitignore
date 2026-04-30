@@ -1,27 +1,33 @@
+# macOS
+.DS_Store
+
+# Python
 .venv/
 __pycache__/
-*.pyc
-.DS_Store
-assets/demo/*.mp4
-assets/demo/*.mov
-assets/demo/*.avi
-assets/demo/*.gif
-assets/demo/*.jpg
-assets/demo/*.png
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Python packaging metadata
-*.egg-info/
-src/*.egg-info/
+# Runtime/debug artifacts
+assets/debug/
 
-# Generated demo artifacts
-assets/demo/*.mp4
-assets/demo/*.mov
-assets/demo/*.avi
-assets/demo/*.log
-assets/demo/*_debug/
-assets/demo/*debug*/
-assets/demo/compare_frames/
-assets/demo/reacq_debug_frames/
-assets/demo/reacq_stability_debug/
-assets/demo/second_puzzle_debug/
-assets/demo/second_puzzle_segmentation_debug/
+# Local checkpoints / backups
+docs/code_backups/
+docs/checkpoints/
+
+# Large local media
+*.mp4
+*.MP4
+*.mov
+*.MOV
+
+# Xcode user/local state
+DerivedData/
+*.xcuserstate
+xcuserdata/
+ios/**/xcuserdata/
+ios/**/*.xcuserstate
+
+# Logs
+*.log

@@ -36,6 +36,49 @@ struct SolveResponse: Decodable {
 final class SolverClient {
     let baseURL = URL(string: "http://192.168.1.74:8000")!
 
+    func detect(imageJPEG: Data) async throws -> SolveResponse {
+        let url = baseURL.appendingPathComponent("detect")
+        var request = URLRequest(url: url, timeoutInterval: 12)
+        request.httpMethod = "POST"
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+
+        body.appendMultipartField(
+            name: "metadata_json",
+            value: #"{"source":"SudokuAROverlay reacquisition detect"}"#,
+            boundary: boundary
+        )
+
+        body.appendMultipartFile(
+            name: "image",
+            filename: "arkit_reacquire_frame.jpg",
+            mimeType: "image/jpeg",
+            data: imageJPEG,
+            boundary: boundary
+        )
+
+        body.appendString("--\(boundary)--\r\n")
+        request.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+
+        guard (200..<300).contains(http.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? "<no response body>"
+            throw NSError(domain: "SolverClient", code: http.statusCode, userInfo: [
+                NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(text)"
+            ])
+        }
+
+        return try JSONDecoder().decode(SolveResponse.self, from: data)
+    }
+
     func solve(imageJPEG: Data) async throws -> SolveResponse {
         let url = baseURL.appendingPathComponent("solve")
         var request = URLRequest(url: url, timeoutInterval: 20)
@@ -110,9 +153,13 @@ extension Data {
 final class AppState: ObservableObject {
     weak var sceneView: ARSCNView?
 
-    @Published var statusText: String = "Tap anywhere to solve"
+    @Published var statusText: String = "Ready"
     @Published var isSolving: Bool = false
     @Published var hasActiveSolutionOverlay: Bool = false
+    @Published var showCaptureGuide: Bool = true
+    @Published var hasAttemptedSolve: Bool = false
+    @Published var lastSolveSucceeded: Bool = false
+    @Published var lastSolveSeconds: Double? = nil
 
     private let solverClient = SolverClient()
     private let ciContext = CIContext()
@@ -121,6 +168,12 @@ final class AppState: ObservableObject {
     // Dynamic ARImageAnchor experiment.
     // This is the most likely path to make the overlay feel glued to the paper.
     private var imageAnchorSolutionTexture: UIImage?
+    private var currentSolveGeneration: Int = 0
+    private var currentReferenceImageName: String = "SolvedSudokuBoard_0"
+    private var isReacquiringPuzzle: Bool = false
+    private var imageTrackingLostFrameCount: Int = 0
+    private let imageTrackingLostGraceFrames: Int = 8
+    private var solvedBoardFingerprint: String? 
     private let boardPhysicalWidthMeters: CGFloat = 0.085
 
     // Dynamic image-anchor reference crop is larger than the Sudoku grid.
@@ -128,8 +181,39 @@ final class AppState: ObservableObject {
     // The solution texture still renders only over the inner board area.
     private let boardReferenceMarginScale: CGFloat = 1.25
 
+    func clearDisplayedSolution() {
+        isSolving = false
+        hasActiveSolutionOverlay = false
+        showCaptureGuide = true
+        hasAttemptedSolve = false
+        lastSolveSucceeded = false
+        lastSolveSeconds = nil
+        statusText = "Ready"
+
+        worldSolutionNode?.removeFromParentNode()
+        worldSolutionNode = nil
+
+        imageAnchorSolutionTexture = nil
+
+        if let sceneView {
+            sceneView.scene.rootNode.enumerateChildNodes { node, _ in
+                if node.name == "dynamicImageAnchorSolutionOverlay" ||
+                    node.name == "poseEstimatedWorldSolutionOverlay" ||
+                    node.name == "lockedWorldSolutionOverlay" ||
+                    node.name == "persistentImageAnchorSolutionOverlay" {
+                    node.removeFromParentNode()
+                }
+            }
+        }
+    }
+
     func sendCurrentFrameToSolver() {
         guard !isSolving else { return }
+
+        showCaptureGuide = false
+        hasAttemptedSolve = true
+        lastSolveSucceeded = false
+        lastSolveSeconds = nil
 
         guard let sceneView,
               let frame = sceneView.session.currentFrame else {
@@ -143,12 +227,16 @@ final class AppState: ObservableObject {
             return
         }
 
+        currentSolveGeneration += 1
+        currentReferenceImageName = "SolvedSudokuBoard_\(currentSolveGeneration)"
+        removeAllDynamicImageAnchorOverlayNodes()
+
         worldSolutionNode?.removeFromParentNode()
         worldSolutionNode = nil
         hasActiveSolutionOverlay = false
 
         isSolving = true
-        statusText = "Sending camera frame to solver..."
+        statusText = "Solving"
 
         Task {
             defer {
@@ -164,21 +252,32 @@ final class AppState: ObservableObject {
 
                 guard response.status == "solved" else {
                     hasActiveSolutionOverlay = false
-                    statusText = "Solver failed: \(response.message ?? "no message")"
+                    lastSolveSucceeded = false
+                    lastSolveSeconds = nil
+                    statusText = "Failed"
                     return
                 }
+
+                solvedBoardFingerprint = boardFingerprint(response.givens)
 
                 let placed = placeWorldSolutionOverlay(response)
                 if placed {
                     hasActiveSolutionOverlay = true
-                    statusText = "Solved | \(latency) | givens \(givens) | image \(imageSize) | tracking board image..."
+                    lastSolveSucceeded = true
+                    lastSolveSeconds = response.latencyMs.map { $0 / 1000.0 }
+                    statusText = "SOLVED!"
                     startDynamicImageAnchorTracking(response: response, capturedImage: capturedUIImage)
                 } else {
                     hasActiveSolutionOverlay = false
+                    lastSolveSucceeded = false
+                    lastSolveSeconds = nil
+                    statusText = "Failed"
                 }
             } catch {
                 hasActiveSolutionOverlay = false
-                statusText = "Solver call failed: \(error.localizedDescription)"
+                lastSolveSucceeded = false
+                lastSolveSeconds = nil
+                statusText = "Failed"
             }
         }
     }
@@ -208,6 +307,130 @@ final class AppState: ObservableObject {
 
         let image = UIImage(cgImage: cgImage)
         return image.jpegData(compressionQuality: 0.85)
+    }
+
+    private func removeAllDynamicImageAnchorOverlayNodes() {
+        guard let sceneView else { return }
+
+        sceneView.scene.rootNode.enumerateChildNodes { node, _ in
+            if node.name == "dynamicImageAnchorSolutionOverlay" {
+                node.removeFromParentNode()
+            }
+        }
+    }
+
+    func imageAnchorTrackingLost() {
+        // ARKit removed/lost the image anchor. Hide the overlay rather than
+        // showing a floating fallback, then actively try to reacquire.
+        imageTrackingLostFrameCount = imageTrackingLostGraceFrames
+        worldSolutionNode?.isHidden = true
+        hasActiveSolutionOverlay = true
+        statusText = "Reacquiring puzzle..."
+        startPuzzleReacquisitionLoop()
+    }
+
+
+    private func boardFingerprint(_ givens: [[Int]]?) -> String? {
+        guard let givens else {
+            return nil
+        }
+
+        var parts: [String] = []
+        for r in 0..<9 {
+            for c in 0..<9 {
+                let value = givens[safe: r]?[safe: c] ?? 0
+                if value != 0 {
+                    parts.append("\(r),\(c),\(value)")
+                }
+            }
+        }
+
+        return parts.joined(separator: "|")
+    }
+
+    private func boardFingerprintSimilarity(_ a: String?, _ b: String?) -> Double {
+        guard let a, let b, !a.isEmpty, !b.isEmpty else {
+            return 0.0
+        }
+
+        let sa = Set(a.split(separator: "|").map(String.init))
+        let sb = Set(b.split(separator: "|").map(String.init))
+
+        guard !sa.isEmpty else {
+            return 0.0
+        }
+
+        let intersection = sa.intersection(sb).count
+        return Double(intersection) / Double(sa.count)
+    }
+
+    private func startPuzzleReacquisitionLoop() {
+        guard !isReacquiringPuzzle else {
+            return
+        }
+
+        guard solvedBoardFingerprint != nil else {
+            return
+        }
+
+        isReacquiringPuzzle = true
+
+        Task {
+            var attempts = 0
+
+            while isReacquiringPuzzle && attempts < 12 {
+                attempts += 1
+
+                try? await Task.sleep(nanoseconds: 800_000_000)
+
+                guard isReacquiringPuzzle else {
+                    break
+                }
+
+                guard let sceneView,
+                      let frame = sceneView.session.currentFrame,
+                      let capturedUIImage = makeUIImage(from: frame.capturedImage),
+                      let jpeg = capturedUIImage.jpegData(compressionQuality: 0.82) else {
+                    continue
+                }
+
+                do {
+                    statusText = "Reacquiring puzzle... \(attempts)"
+
+                    let response = try await solverClient.detect(imageJPEG: jpeg)
+
+                    guard response.status == "solved" else {
+                        continue
+                    }
+
+                    let detectedFingerprint = boardFingerprint(response.givens)
+                    let similarity = boardFingerprintSimilarity(solvedBoardFingerprint, detectedFingerprint)
+
+                    if similarity >= 0.70 {
+                        statusText = "Puzzle reacquired | match \(String(format: "%.0f%%", similarity * 100))"
+                        startDynamicImageAnchorTracking(response: response, capturedImage: capturedUIImage)
+                        isReacquiringPuzzle = false
+                        return
+                    } else {
+                        // Different puzzle or bad OCR. Do not attach old answer.
+                        statusText = "Different puzzle detected — press Solve"
+                        isReacquiringPuzzle = false
+                        hasActiveSolutionOverlay = false
+                        removeAllDynamicImageAnchorOverlayNodes()
+                        worldSolutionNode?.removeFromParentNode()
+                        worldSolutionNode = nil
+                        return
+                    }
+                } catch {
+                    continue
+                }
+            }
+
+            if isReacquiringPuzzle {
+                isReacquiringPuzzle = false
+                statusText = "Puzzle lost — point back at puzzle or press Solve"
+            }
+        }
     }
 
     private func startDynamicImageAnchorTracking(response: SolveResponse, capturedImage: UIImage) {
@@ -240,7 +463,7 @@ final class AppState: ObservableObject {
             orientation: .up,
             physicalWidth: boardPhysicalWidthMeters * boardReferenceMarginScale
         )
-        referenceImage.name = "SolvedSudokuBoard"
+        referenceImage.name = currentReferenceImageName
 
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal]
@@ -326,42 +549,64 @@ final class AppState: ObservableObject {
             return
         }
 
-        anchorNode.childNode(withName: "dynamicImageAnchorSolutionOverlay", recursively: false)?
-            .removeFromParentNode()
+        let overlayName = "dynamicImageAnchorSolutionOverlay"
 
-        // Remove fallback table-plane overlay once true image anchor is active.
-        worldSolutionNode?.removeFromParentNode()
-        worldSolutionNode = nil
+        // Ignore stale anchors from previous solves/puzzles.
+        guard imageAnchor.referenceImage.name == currentReferenceImageName else {
+            anchorNode.childNode(withName: overlayName, recursively: false)?.isHidden = true
+            return
+        }
 
-        // The image anchor tracks a larger crop around the Sudoku board,
-        // but the solved digits should cover only the inner Sudoku grid.
-        let plane = SCNPlane(
-            width: boardPhysicalWidthMeters,
-            height: boardPhysicalWidthMeters
-        )
+        // If image tracking drops, hide the overlay instead of showing the
+        // less-accurate table/world fallback. The fallback visibly floats/lifts
+        // during movement, which is worse than a short reacquire state.
+        guard imageAnchor.isTracked else {
+            anchorNode.childNode(withName: overlayName, recursively: false)?.isHidden = true
+            worldSolutionNode?.isHidden = true
+            hasActiveSolutionOverlay = false
+            statusText = "Reacquiring puzzle..."
+            return
+        }
 
-        let material = SCNMaterial()
-        material.diffuse.contents = solutionTexture
-        material.lightingModel = .constant
-        material.isDoubleSided = true
-        material.transparencyMode = .aOne
-        material.blendMode = .alpha
-        material.readsFromDepthBuffer = true
-        material.writesToDepthBuffer = false
-        material.transparency = 0.92
+        // Image anchor is actively tracked, so show the precise image overlay.
+        worldSolutionNode?.isHidden = true
 
-        plane.materials = [material]
+        let overlayNode: SCNNode
 
-        let overlayNode = SCNNode(geometry: plane)
-        overlayNode.name = "dynamicImageAnchorSolutionOverlay"
+        if let existing = anchorNode.childNode(withName: overlayName, recursively: false) {
+            overlayNode = existing
+            overlayNode.isHidden = false
+        } else {
+            // The image anchor tracks a larger crop around the Sudoku board,
+            // but the solved digits should cover only the inner Sudoku grid.
+            let plane = SCNPlane(
+                width: boardPhysicalWidthMeters,
+                height: boardPhysicalWidthMeters
+            )
 
-        // ARImageAnchor lies in the X/Z plane; SCNPlane is X/Y by default.
-        overlayNode.eulerAngles.x = -.pi / 2.0
+            let material = SCNMaterial()
+            material.diffuse.contents = solutionTexture
+            material.lightingModel = .constant
+            material.isDoubleSided = true
+            material.transparencyMode = .aOne
+            material.blendMode = .alpha
+            material.readsFromDepthBuffer = true
+            material.writesToDepthBuffer = false
+            material.transparency = 0.90
 
-        // Keep nearly flush. This is tiny: 0.05 mm.
-        overlayNode.position = SCNVector3(0, 0.00005, 0)
+            plane.materials = [material]
 
-        anchorNode.addChildNode(overlayNode)
+            overlayNode = SCNNode(geometry: plane)
+            overlayNode.name = overlayName
+
+            // ARImageAnchor lies in X/Z; SCNPlane is X/Y by default.
+            overlayNode.eulerAngles.x = -.pi / 2.0
+
+            // Keep almost flush on the image plane.
+            overlayNode.position = SCNVector3(0, 0.000003, 0)
+
+            anchorNode.addChildNode(overlayNode)
+        }
 
         hasActiveSolutionOverlay = true
         statusText = "Solved | image-anchor overlay active"
@@ -510,7 +755,7 @@ final class AppState: ObservableObject {
         overlayNode.eulerAngles.x = -.pi / 2.0
 
         // Tiny offset above board plane to avoid flicker/z-fighting.
-        overlayNode.position = SCNVector3(0, 0.00008, 0)
+        overlayNode.position = SCNVector3(0, 0.00001, 0)
 
         root.addChildNode(overlayNode)
 
@@ -535,7 +780,7 @@ final class AppState: ObservableObject {
             // Strong blue, slightly lighter than before, but not light blue.
             let digitColor = UIColor(red: 0.08, green: 0.32, blue: 0.95, alpha: 0.96)
 
-            let font = UIFont.systemFont(ofSize: 76, weight: .semibold)
+            let font = UIFont.systemFont(ofSize: 65, weight: .semibold)
 
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
@@ -632,89 +877,104 @@ struct ContentView: View {
     @StateObject private var appState = AppState()
 
     var body: some View {
-        ZStack(alignment: .top) {
+        ZStack {
             ARSudokuView(appState: appState)
                 .ignoresSafeArea()
 
-            // Full-screen tap still works, but the visible button below is now
-            // the reliable primary control.
-            Color.clear
-                .contentShape(Rectangle())
-                .ignoresSafeArea()
-                .onTapGesture {
-                    guard !appState.isSolving else { return }
-                    appState.statusText = "Tap received. Sending frame..."
-                    appState.sendCurrentFrameToSolver()
-                }
-
-            if !appState.isSolving && !appState.hasActiveSolutionOverlay {
+            if appState.showCaptureGuide && !appState.isSolving {
                 CornerCaptureGuide()
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
             }
 
-            VStack(spacing: 7) {
-                Text("Sudoku AR Overlay")
-                    .font(.caption)
-                    .bold()
+            VStack {
+                statusPanel
+                    .padding(.top, 12)
+                    .padding(.horizontal, 12)
 
-                Text(appState.statusText)
-                    .font(.caption2)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 8)
+                Spacer()
 
-                HStack(spacing: 8) {
-                    if appState.isSolving {
-                        Button("Reset") {
-                            appState.forceResetSolveState()
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.red.opacity(0.75))
-                        .clipShape(Capsule())
-                    } else {
-                        Button(appState.hasActiveSolutionOverlay ? "Rescan / Solve Again" : "Solve Puzzle") {
-                            appState.statusText = "Button pressed. Sending frame..."
-                            appState.sendCurrentFrameToSolver()
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.blue.opacity(0.78))
-                        .clipShape(Capsule())
-
-                        Button("Reset") {
-                            appState.forceResetSolveState()
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.92))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.black.opacity(0.35))
-                        .clipShape(Capsule())
-                    }
-                }
-
-                Text(appState.isSolving ? "Solving..." : (appState.hasActiveSolutionOverlay ? "Press Rescan to solve a new frame" : "Fill corners with puzzle, then press Solve"))
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.80))
+                bottomControls
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 28)
             }
-            .padding(.top, 10)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .foregroundStyle(.white)
-            .shadow(radius: 3)
-            .background(
-                Color.black.opacity(0.34)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-            )
-            .padding(.horizontal, 10)
         }
     }
+
+    private var statusPanel: some View {
+        VStack(spacing: 3) {
+            if appState.isSolving {
+                Text("Solving")
+                    .font(.headline)
+                    .bold()
+            } else if appState.lastSolveSucceeded {
+                Text("SOLVED!")
+                    .font(.headline)
+                    .bold()
+
+                if let seconds = appState.lastSolveSeconds {
+                    Text(String(format: "%.2f seconds", seconds))
+                        .font(.caption)
+                        .monospacedDigit()
+                }
+            } else if appState.hasAttemptedSolve {
+                Text("Failed")
+                    .font(.headline)
+                    .bold()
+            } else {
+                Text("Line up puzzle")
+                    .font(.caption)
+                    .bold()
+            }
+        }
+        .foregroundStyle(.white)
+        .shadow(radius: 3)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(
+            Color.black.opacity(0.34)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+        )
+        .allowsHitTesting(false)
+    }
+
+    private var bottomControls: some View {
+        HStack(spacing: 12) {
+            Button {
+                appState.sendCurrentFrameToSolver()
+            } label: {
+                Text(appState.hasActiveSolutionOverlay ? "Re-scan" : "Scan")
+                    .font(.headline)
+                    .bold()
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+            }
+            .foregroundStyle(.white)
+            .background(
+                appState.isSolving
+                ? Color.gray.opacity(0.65)
+                : Color.blue.opacity(0.86)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .disabled(appState.isSolving)
+
+            Button {
+                appState.clearDisplayedSolution()
+            } label: {
+                Text("Clear")
+                    .font(.headline)
+                    .bold()
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+            }
+            .foregroundStyle(.white)
+            .background(Color.black.opacity(0.52))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+        }
+        .shadow(radius: 4)
+    }
 }
+
 
 
 struct CornerCaptureGuide: View {
@@ -828,6 +1088,16 @@ struct ARSudokuView: UIViewRepresentable {
 
             Task { @MainActor in
                 self.appState?.attachImageAnchorOverlay(to: node, imageAnchor: imageAnchor)
+            }
+        }
+
+        func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
+            guard anchor is ARImageAnchor else {
+                return
+            }
+
+            Task { @MainActor in
+                self.appState?.imageAnchorTrackingLost()
             }
         }
     }

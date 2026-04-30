@@ -99,3 +99,63 @@ async def solve(
     response = to_py(result.__dict__)
     response["debug"]["metadata"] = metadata
     return response
+
+
+@app.post("/detect")
+async def detect(
+    image: UploadFile = File(...),
+    metadata_json: str | None = Form(default=None),
+):
+    """Experimental board reacquisition endpoint.
+
+    For now this reuses the existing solver pipeline so it can return:
+    - status
+    - corners_px
+    - givens
+    - solution
+    - givens_count
+
+    Later, this should become a cheaper detect-only path.
+    """
+    metadata = {}
+    if metadata_json:
+        try:
+            metadata = json.loads(metadata_json)
+        except Exception:
+            metadata = {"metadata_parse_error": metadata_json}
+
+    raw = await image.read()
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return {
+            "status": "failed",
+            "message": "Could not decode uploaded image.",
+            "latency_ms": 0.0,
+            "confidence": 0.0,
+            "image_width": None,
+            "image_height": None,
+            "corners_px": None,
+            "givens": None,
+            "solution": None,
+            "givens_count": 0,
+            "debug": {
+                "metadata": metadata,
+                "mode": "detect",
+            },
+        }
+
+    solver_repo = os.environ.get("SUDOKU_SOLVER_REPO", DEFAULT_SOLVER_REPO)
+
+    result = solve_frame_for_ar(
+        frame,
+        repo_root=solver_repo,
+        debug_dir="assets/debug",
+    )
+
+    response = to_py(result.__dict__)
+    response["debug"]["metadata"] = metadata
+    response["debug"]["mode"] = "detect_reacquisition"
+    return response
+
