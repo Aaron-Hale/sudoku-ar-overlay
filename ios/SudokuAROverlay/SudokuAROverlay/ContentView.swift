@@ -34,15 +34,36 @@ struct SolveResponse: Decodable {
 }
 
 final class SolverClient {
-    // For physical iPhone testing, set this to your Mac Wi-Fi IP, for example:
-    // http://<MAC_WIFI_IP>:8000
-    //
-    // The current MVP still uses a local Python backend. A future production
-    // version should move inference on-device or use a configurable backend URL.
-    private let baseURL = URL(string: "http://127.0.0.1:8000")!
+    private func endpoint(baseURLString: String, path: String) throws -> URL {
+        let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
 
-    func detect(imageJPEG: Data) async throws -> SolveResponse {
-        let url = baseURL.appendingPathComponent("detect")
+        guard let baseURL = URL(string: normalized),
+              let scheme = baseURL.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            throw NSError(domain: "SolverClient", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "Invalid backend URL. Use http://<MAC_WIFI_IP>:8000"
+            ])
+        }
+
+        return baseURL.appendingPathComponent(path)
+    }
+
+    func health(baseURLString: String) async throws {
+        let url = try endpoint(baseURLString: baseURLString, path: "health")
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "GET"
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+    }
+
+    func detect(imageJPEG: Data, baseURLString: String) async throws -> SolveResponse {
+        let url = try endpoint(baseURLString: baseURLString, path: "detect")
         var request = URLRequest(url: url, timeoutInterval: 12)
         request.httpMethod = "POST"
 
@@ -84,8 +105,8 @@ final class SolverClient {
         return try JSONDecoder().decode(SolveResponse.self, from: data)
     }
 
-    func solve(imageJPEG: Data) async throws -> SolveResponse {
-        let url = baseURL.appendingPathComponent("solve")
+    func solve(imageJPEG: Data, baseURLString: String) async throws -> SolveResponse {
+        let url = try endpoint(baseURLString: baseURLString, path: "solve")
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = "POST"
 
@@ -156,7 +177,16 @@ extension Data {
 
 @MainActor
 final class AppState: ObservableObject {
+    private static let backendURLKey = "SudokuARBackendURL"
+    private static let defaultBackendURL = "http://127.0.0.1:8000"
+
     weak var sceneView: ARSCNView?
+
+    @Published var backendURLString: String {
+        didSet {
+            UserDefaults.standard.set(backendURLString, forKey: Self.backendURLKey)
+        }
+    }
 
     @Published var statusText: String = "Ready"
     @Published var isSolving: Bool = false
@@ -169,6 +199,34 @@ final class AppState: ObservableObject {
     private let solverClient = SolverClient()
     private let ciContext = CIContext()
     private var worldSolutionNode: SCNNode?
+
+    init() {
+        self.backendURLString = UserDefaults.standard.string(forKey: Self.backendURLKey)
+            ?? Self.defaultBackendURL
+    }
+
+    func updateBackendURL(_ value: String) {
+        backendURLString = value
+    }
+
+    func normalizeBackendURL() {
+        let trimmed = backendURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        backendURLString = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+    }
+
+    func pingBackend() {
+        normalizeBackendURL()
+        statusText = "Pinging backend..."
+
+        Task {
+            do {
+                try await solverClient.health(baseURLString: backendURLString)
+                statusText = "Backend reachable"
+            } catch {
+                statusText = "Backend unreachable"
+            }
+        }
+    }
 
     // Dynamic ARImageAnchor experiment.
     // This is the most likely path to make the overlay feel glued to the paper.
@@ -249,7 +307,7 @@ final class AppState: ObservableObject {
             }
 
             do {
-                let response = try await solverClient.solve(imageJPEG: jpeg)
+                let response = try await solverClient.solve(imageJPEG: jpeg, baseURLString: backendURLString)
 
                 let latency = response.latencyMs.map { String(format: "%.0f ms", $0) } ?? "n/a"
                 let givens = response.givensCount.map { "\($0)" } ?? "n/a"
@@ -402,7 +460,7 @@ final class AppState: ObservableObject {
                 do {
                     statusText = "Reacquiring puzzle... \(attempts)"
 
-                    let response = try await solverClient.detect(imageJPEG: jpeg)
+                    let response = try await solverClient.detect(imageJPEG: jpeg, baseURLString: backendURLString)
 
                     guard response.status == "solved" else {
                         continue
@@ -880,6 +938,7 @@ final class AppState: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var appState = AppState()
+    @State private var showBackendSettings = false
 
     var body: some View {
         ZStack {
@@ -897,6 +956,9 @@ struct ContentView: View {
                     .padding(.top, 12)
                     .padding(.horizontal, 12)
 
+                backendPanel
+                    .padding(.horizontal, 12)
+
                 Spacer()
 
                 bottomControls
@@ -904,6 +966,62 @@ struct ContentView: View {
                     .padding(.bottom, 28)
             }
         }
+    }
+
+    private var backendPanel: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Button {
+                    showBackendSettings.toggle()
+                } label: {
+                    Text(showBackendSettings ? "Hide Backend" : "Backend")
+                        .font(.caption)
+                        .bold()
+                }
+
+                Spacer()
+
+                Button {
+                    appState.pingBackend()
+                } label: {
+                    Text("Ping")
+                        .font(.caption)
+                        .bold()
+                }
+            }
+
+            if showBackendSettings {
+                TextField(
+                    "http://<MAC_WIFI_IP>:8000",
+                    text: Binding(
+                        get: { appState.backendURLString },
+                        set: { appState.updateBackendURL($0) }
+                    )
+                )
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .keyboardType(.URL)
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.92))
+                .foregroundStyle(.black)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                Text("Use your Mac Wi-Fi IP while the local FastAPI backend is running.")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.86))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            Color.black.opacity(0.34)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+        )
+        .foregroundStyle(.white)
+        .shadow(radius: 3)
     }
 
     private var statusPanel: some View {

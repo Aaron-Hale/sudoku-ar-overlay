@@ -254,7 +254,7 @@ http://<MAC_WIFI_IP>:8000
 1. Open `ios/SudokuAROverlay/SudokuAROverlay.xcodeproj` in Xcode.
 2. Select a physical iPhone as the target.
 3. Set your Apple signing team in Xcode if needed.
-4. Make sure the app backend URL points to your Mac Wi-Fi IP.
+4. Use the app's **Backend** panel to set `http://<MAC_WIFI_IP>:8000`, then tap **Ping**.
 5. Build and run.
 6. Use **Scan** to solve.
 7. Use **Re-scan** if the solve or tracking looks wrong.
@@ -357,7 +357,7 @@ The main product lesson was to use ARKit for live camera/world tracking and keep
 
 Near-term cleanup and hardening:
 
-- Replace hardcoded development backend URL with an in-app backend setting.
+- Keep the in-app backend setting simple and add local discovery if needed.
 - Add a **Ping Backend** check in the app.
 - Improve user-facing errors when the backend is unreachable.
 - Harden **Clear** and **Re-scan** against stale overlays.
