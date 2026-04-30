@@ -59,22 +59,24 @@ Known limitations:
 
 ## Prototype metrics
 
-Formal OCR/model accuracy is reported in the companion [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) repo. This repo reports mobile/AR integration behavior.
+Formal OCR/model accuracy and frozen perception benchmarks are reported in the companion [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) repo. This repo reports mobile/AR integration behavior.
 
-Warm local-backend validation run:
+The current app is a **FastAPI-backed prototype**, not an edge deployment. The metrics below separate the current demo latency from the solver/runtime story.
 
-| Metric | Result | Notes |
-|---|---:|---|
-| Scan-to-overlay success | **20 / 20** | Same local setup, measured after backend warmup |
-| p50 scan-to-overlay latency | **756.9 ms** | Tap **Scan** → AR overlay placed |
-| p95 scan-to-overlay latency | **917.2 ms** | Tap **Scan** → AR overlay placed |
-| p50 backend-reported latency | **501.0 ms** | Backend `/solve` reported latency |
-| p95 backend-reported latency | **551.1 ms** | Backend `/solve` reported latency |
-| p50 capture + JPEG encode | **23.0 ms** | iPhone frame capture/encode path |
-| p50 overlay placement | **18.1 ms** | JSON decoded → AR overlay placed |
+| Category | Metric | Result | Notes |
+|---|---|---:|---|
+| **FastAPI demo** | Scan-to-overlay success | **20 / 20** | Warm local-backend validation run |
+| **FastAPI demo** | p50 scan-to-overlay latency | **756.9 ms** | Tap **Scan** → AR overlay placed |
+| **FastAPI demo** | p95 scan-to-overlay latency | **917.2 ms** | Tap **Scan** → AR overlay placed |
+| **Backend `/solve`** | p50 backend-reported latency | **501.0 ms** | Local FastAPI service path |
+| **Backend `/solve`** | p95 backend-reported latency | **551.1 ms** | Local FastAPI service path |
+| **Solver repo** | Frozen hot-path runtime | **233.2 ms mean / 239.6 ms p95** | Published in the companion solver repo |
+| **API / app overhead** | Implied p50 overhead | **~255.9 ms** | Total p50 minus backend p50 |
+| **API / app overhead** | Implied p95 overhead | **~366.1 ms** | Total p95 minus backend p95 |
 
-These are prototype integration metrics from a warm local-backend run, not formal OCR/model benchmarks and not yet a full multi-condition AR tracking benchmark. See [`docs/metrics/prototype_metrics_summary.md`](docs/metrics/prototype_metrics_summary.md) for details.
+Interpretation: the current FastAPI demo proves the live AR + ML service boundary, but it includes local Wi-Fi, HTTP/multipart handling, JSON response handling, and app-side overlay update. A production edge implementation should remove the Wi-Fi/FastAPI dependency and the measured service-boundary overhead. Final on-device latency is not claimed here because the perception stack has not yet been converted to Core ML or benchmarked on-device.
 
+See [`docs/metrics/prototype_metrics_summary.md`](docs/metrics/prototype_metrics_summary.md) for the full breakdown and limitations.
 ---
 
 ## Why this project is interesting
