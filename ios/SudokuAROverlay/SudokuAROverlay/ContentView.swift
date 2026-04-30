@@ -34,7 +34,12 @@ struct SolveResponse: Decodable {
 }
 
 final class SolverClient {
-    let baseURL = URL(string: "http://192.168.1.74:8000")!
+    // For physical iPhone testing, set this to your Mac Wi-Fi IP, for example:
+    // http://<MAC_WIFI_IP>:8000
+    //
+    // The current MVP still uses a local Python backend. A future production
+    // version should move inference on-device or use a configurable backend URL.
+    private let baseURL = URL(string: "http://127.0.0.1:8000")!
 
     func detect(imageJPEG: Data) async throws -> SolveResponse {
         let url = baseURL.appendingPathComponent("detect")

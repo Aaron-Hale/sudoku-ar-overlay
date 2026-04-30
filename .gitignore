@@ -8,26 +8,48 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+
+# Environment / local secrets
+.env
+.env.*
+!.env.example
 
 # Runtime/debug artifacts
 assets/debug/
+*.log
 
 # Local checkpoints / backups
 docs/code_backups/
 docs/checkpoints/
 
-# Large local media
+# Large local media / raw captures
 *.mp4
 *.MP4
 *.mov
 *.MOV
+*.heic
+*.HEIC
+
+# Keep intentional portfolio demo media tracked
+!docs/demo/demo.mp4
+!docs/demo/demo_preview.gif
 
 # Xcode user/local state
 DerivedData/
+build/
 *.xcuserstate
 xcuserdata/
 ios/**/xcuserdata/
 ios/**/*.xcuserstate
+*.xcarchive
+*.ipa
 
-# Logs
-*.log
+# Editor files
+.vscode/
+.idea/
+*.swp
+
+# Local source backups
+ios/backups/
