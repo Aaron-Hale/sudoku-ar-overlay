@@ -57,6 +57,26 @@ Known limitations:
 
 ---
 
+## Prototype metrics
+
+Formal OCR/model accuracy is reported in the companion [`sudoku-image-solver`](https://github.com/Aaron-Hale/sudoku-image-solver) repo. This repo reports mobile/AR integration behavior.
+
+Warm local-backend validation run:
+
+| Metric | Result | Notes |
+|---|---:|---|
+| Scan-to-overlay success | **20 / 20** | Same local setup, measured after backend warmup |
+| p50 scan-to-overlay latency | **756.9 ms** | Tap **Scan** → AR overlay placed |
+| p95 scan-to-overlay latency | **917.2 ms** | Tap **Scan** → AR overlay placed |
+| p50 backend-reported latency | **501.0 ms** | Backend `/solve` reported latency |
+| p95 backend-reported latency | **551.1 ms** | Backend `/solve` reported latency |
+| p50 capture + JPEG encode | **23.0 ms** | iPhone frame capture/encode path |
+| p50 overlay placement | **18.1 ms** | JSON decoded → AR overlay placed |
+
+These are prototype integration metrics from a warm local-backend run, not formal OCR/model benchmarks and not yet a full multi-condition AR tracking benchmark. See [`docs/metrics/prototype_metrics_summary.md`](docs/metrics/prototype_metrics_summary.md) for details.
+
+---
+
 ## Why this project is interesting
 
 This project combines a real-image Sudoku OCR engine with a live mobile AR interface. The product problem is not only reading a puzzle from a camera frame, but also registering the solved answer back onto the same physical paper in a way that feels anchored during handheld camera motion.
