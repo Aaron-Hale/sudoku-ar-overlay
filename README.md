@@ -309,7 +309,10 @@ Generated metrics under `assets/metrics/` are local runtime artifacts and are ig
 Example backend benchmark:
 
 ```bash
-python python/scripts/benchmark_solve_endpoint.py   --image assets/demo/test_image.jpg   --warmup 3   --trials 20
+python python/scripts/benchmark_solve_endpoint.py \
+  --image assets/demo/test_image.jpg \
+  --warmup 3 \
+  --trials 20
 ```
 
 ---
@@ -490,7 +493,9 @@ Accepts app-side prototype metrics and appends them to a local CSV under `assets
 Example:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/metrics   -H "Content-Type: application/json"   -d '{"trial_id":"manual_test","event_source":"curl","status":"solved","total_scan_to_overlay_ms":512}'
+curl -X POST http://127.0.0.1:8000/metrics \
+  -H "Content-Type: application/json" \
+  -d '{"trial_id":"manual_test","event_source":"curl","status":"solved","total_scan_to_overlay_ms":512}'
 ```
 
 ### `POST /detect`
