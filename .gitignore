@@ -18,6 +18,7 @@ htmlcov/
 
 # Runtime/debug artifacts
 assets/debug/
+assets/metrics/
 *.log
 
 # Local checkpoints / backups
