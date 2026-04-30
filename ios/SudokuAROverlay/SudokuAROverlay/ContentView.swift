@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 import Combine
 import ARKit
 import SceneKit
@@ -33,6 +34,12 @@ struct SolveResponse: Decodable {
     }
 }
 
+struct TimedSolveResponse {
+    let response: SolveResponse
+    let requestRoundtripMs: Double
+    let responseDecodeMs: Double
+}
+
 final class SolverClient {
     private func endpoint(baseURLString: String, path: String) throws -> URL {
         let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -59,6 +66,20 @@ final class SolverClient {
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             throw URLError(.badServerResponse)
+        }
+    }
+
+    func postMetric(baseURLString: String, payload: [String: Any]) async {
+        do {
+            let url = try endpoint(baseURLString: baseURLString, path: "metrics")
+            var request = URLRequest(url: url, timeoutInterval: 5)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+
+            _ = try await URLSession.shared.data(for: request)
+        } catch {
+            // Metrics must never block or break the demo path.
         }
     }
 
@@ -105,7 +126,7 @@ final class SolverClient {
         return try JSONDecoder().decode(SolveResponse.self, from: data)
     }
 
-    func solve(imageJPEG: Data, baseURLString: String) async throws -> SolveResponse {
+    func solve(imageJPEG: Data, baseURLString: String) async throws -> TimedSolveResponse {
         let url = try endpoint(baseURLString: baseURLString, path: "solve")
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = "POST"
@@ -132,7 +153,9 @@ final class SolverClient {
         body.appendString("--\(boundary)--\r\n")
         request.httpBody = body
 
+        let requestStartedAt = Date()
         let (data, response) = try await URLSession.shared.data(for: request)
+        let responseReceivedAt = Date()
 
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
@@ -145,7 +168,14 @@ final class SolverClient {
             ])
         }
 
-        return try JSONDecoder().decode(SolveResponse.self, from: data)
+        let decoded = try JSONDecoder().decode(SolveResponse.self, from: data)
+        let responseDecodedAt = Date()
+
+        return TimedSolveResponse(
+            response: decoded,
+            requestRoundtripMs: responseReceivedAt.timeIntervalSince(requestStartedAt) * 1000.0,
+            responseDecodeMs: responseDecodedAt.timeIntervalSince(responseReceivedAt) * 1000.0
+        )
     }
 }
 
@@ -228,6 +258,20 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func msBetween(_ start: Date, _ end: Date) -> Double {
+        (end.timeIntervalSince(start) * 1000.0 * 1000.0).rounded() / 1000.0
+    }
+
+    private func postScanMetric(_ payload: [String: Any]) {
+        var metric = payload
+        metric["event_source"] = "ios_app"
+        metric["backend_url"] = backendURLString
+
+        Task {
+            await solverClient.postMetric(baseURLString: backendURLString, payload: metric)
+        }
+    }
+
     // Dynamic ARImageAnchor experiment.
     // This is the most likely path to make the overlay feel glued to the paper.
     private var imageAnchorSolutionTexture: UIImage?
@@ -273,6 +317,9 @@ final class AppState: ObservableObject {
     func sendCurrentFrameToSolver() {
         guard !isSolving else { return }
 
+        let scanStartedAt = Date()
+        let trialID = UUID().uuidString
+
         showCaptureGuide = false
         hasAttemptedSolve = true
         lastSolveSucceeded = false
@@ -281,14 +328,34 @@ final class AppState: ObservableObject {
         guard let sceneView,
               let frame = sceneView.session.currentFrame else {
             statusText = "No AR frame available yet."
+            let now = Date()
+            postScanMetric([
+                "trial_id": trialID,
+                "status": "failed",
+                "solve_status": "no_ar_frame",
+                "overlay_placed": false,
+                "failure_stage": "capture",
+                "total_scan_attempt_ms": msBetween(scanStartedAt, now)
+            ])
             return
         }
 
         guard let capturedUIImage = makeUIImage(from: frame.capturedImage),
               let jpeg = capturedUIImage.jpegData(compressionQuality: 0.85) else {
             statusText = "Could not convert AR frame to JPEG."
+            let now = Date()
+            postScanMetric([
+                "trial_id": trialID,
+                "status": "failed",
+                "solve_status": "jpeg_encode_failed",
+                "overlay_placed": false,
+                "failure_stage": "capture",
+                "total_scan_attempt_ms": msBetween(scanStartedAt, now)
+            ])
             return
         }
+
+        let jpegReadyAt = Date()
 
         currentSolveGeneration += 1
         currentReferenceImageName = "SolvedSudokuBoard_\(currentSolveGeneration)"
@@ -307,40 +374,109 @@ final class AppState: ObservableObject {
             }
 
             do {
-                let response = try await solverClient.solve(imageJPEG: jpeg, baseURLString: backendURLString)
+                let timedResponse = try await solverClient.solve(imageJPEG: jpeg, baseURLString: backendURLString)
+                let response = timedResponse.response
 
                 let latency = response.latencyMs.map { String(format: "%.0f ms", $0) } ?? "n/a"
                 let givens = response.givensCount.map { "\($0)" } ?? "n/a"
                 let imageSize = "\(response.imageWidth ?? 0)x\(response.imageHeight ?? 0)"
 
                 guard response.status == "solved" else {
+                    let finishedAt = Date()
                     hasActiveSolutionOverlay = false
                     lastSolveSucceeded = false
                     lastSolveSeconds = nil
                     statusText = "Failed"
+
+                    postScanMetric([
+                        "trial_id": trialID,
+                        "status": "failed",
+                        "solve_status": response.status,
+                        "overlay_placed": false,
+                        "failure_stage": "backend",
+                        "givens_count": response.givensCount ?? 0,
+                        "image_width": response.imageWidth ?? 0,
+                        "image_height": response.imageHeight ?? 0,
+                        "capture_encode_ms": msBetween(scanStartedAt, jpegReadyAt),
+                        "request_roundtrip_ms": timedResponse.requestRoundtripMs,
+                        "response_decode_ms": timedResponse.responseDecodeMs,
+                        "total_scan_attempt_ms": msBetween(scanStartedAt, finishedAt),
+                        "backend_latency_ms": response.latencyMs ?? 0.0
+                    ])
                     return
                 }
 
                 solvedBoardFingerprint = boardFingerprint(response.givens)
 
+                let overlayStartedAt = Date()
                 let placed = placeWorldSolutionOverlay(response)
+                let overlayPlacedAt = Date()
+
                 if placed {
                     hasActiveSolutionOverlay = true
                     lastSolveSucceeded = true
                     lastSolveSeconds = response.latencyMs.map { $0 / 1000.0 }
                     statusText = "SOLVED!"
                     startDynamicImageAnchorTracking(response: response, capturedImage: capturedUIImage)
+
+                    postScanMetric([
+                        "trial_id": trialID,
+                        "status": "solved",
+                        "solve_status": response.status,
+                        "overlay_placed": true,
+                        "failure_stage": "",
+                        "givens_count": response.givensCount ?? 0,
+                        "image_width": response.imageWidth ?? 0,
+                        "image_height": response.imageHeight ?? 0,
+                        "capture_encode_ms": msBetween(scanStartedAt, jpegReadyAt),
+                        "request_roundtrip_ms": timedResponse.requestRoundtripMs,
+                        "response_decode_ms": timedResponse.responseDecodeMs,
+                        "overlay_place_ms": msBetween(overlayStartedAt, overlayPlacedAt),
+                        "total_scan_to_overlay_ms": msBetween(scanStartedAt, overlayPlacedAt),
+                        "total_scan_attempt_ms": msBetween(scanStartedAt, overlayPlacedAt),
+                        "backend_latency_ms": response.latencyMs ?? 0.0
+                    ])
                 } else {
+                    let finishedAt = Date()
                     hasActiveSolutionOverlay = false
                     lastSolveSucceeded = false
                     lastSolveSeconds = nil
                     statusText = "Failed"
+
+                    postScanMetric([
+                        "trial_id": trialID,
+                        "status": "failed",
+                        "solve_status": response.status,
+                        "overlay_placed": false,
+                        "failure_stage": "placement",
+                        "givens_count": response.givensCount ?? 0,
+                        "image_width": response.imageWidth ?? 0,
+                        "image_height": response.imageHeight ?? 0,
+                        "capture_encode_ms": msBetween(scanStartedAt, jpegReadyAt),
+                        "request_roundtrip_ms": timedResponse.requestRoundtripMs,
+                        "response_decode_ms": timedResponse.responseDecodeMs,
+                        "overlay_place_ms": msBetween(overlayStartedAt, overlayPlacedAt),
+                        "total_scan_attempt_ms": msBetween(scanStartedAt, finishedAt),
+                        "backend_latency_ms": response.latencyMs ?? 0.0
+                    ])
                 }
             } catch {
+                let finishedAt = Date()
                 hasActiveSolutionOverlay = false
                 lastSolveSucceeded = false
                 lastSolveSeconds = nil
                 statusText = "Failed"
+
+                postScanMetric([
+                    "trial_id": trialID,
+                    "status": "error",
+                    "solve_status": "error",
+                    "overlay_placed": false,
+                    "failure_stage": "request",
+                    "capture_encode_ms": msBetween(scanStartedAt, jpegReadyAt),
+                    "total_scan_attempt_ms": msBetween(scanStartedAt, finishedAt),
+                    "notes": String(describing: error)
+                ])
             }
         }
     }
