@@ -1,17 +1,88 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import Body, FastAPI, File, Form, UploadFile
 
 from .sudoku_solver_client import DEFAULT_SOLVER_REPO, solve_frame_for_ar, to_py
 
 
 app = FastAPI(title="Sudoku AR Overlay Solver Service")
+
+
+METRICS_DIR = Path("assets/metrics")
+AR_TRIALS_CSV = METRICS_DIR / "ar_trials.csv"
+
+AR_TRIAL_FIELDNAMES = [
+    "created_at",
+    "trial_id",
+    "event_source",
+    "puzzle_id",
+    "condition",
+    "backend_url",
+    "status",
+    "solve_status",
+    "overlay_placed",
+    "user_visible_success",
+    "failure_stage",
+    "givens_count",
+    "image_width",
+    "image_height",
+    "capture_encode_ms",
+    "request_roundtrip_ms",
+    "response_decode_ms",
+    "overlay_place_ms",
+    "total_scan_to_overlay_ms",
+    "total_scan_attempt_ms",
+    "backend_latency_ms",
+    "tracking_window_s",
+    "tracking_lost_count",
+    "overlay_remained_visible",
+    "overlay_remained_usable",
+    "reacquisition_attempted",
+    "reacquisition_success",
+    "reacquisition_time_ms",
+    "false_attach_observed",
+    "visual_alignment_rating",
+    "notes",
+]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _flatten_metric_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    row = {key: "" for key in AR_TRIAL_FIELDNAMES}
+    row["created_at"] = payload.get("created_at") or utc_now_iso()
+
+    for key in AR_TRIAL_FIELDNAMES:
+        if key in payload and payload[key] is not None:
+            row[key] = payload[key]
+
+    return row
+
+
+def append_ar_trial_metric(payload: dict[str, Any]) -> Path:
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    file_exists = AR_TRIALS_CSV.exists()
+
+    row = _flatten_metric_payload(payload)
+
+    with AR_TRIALS_CSV.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=AR_TRIAL_FIELDNAMES)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    return AR_TRIALS_CSV
 
 
 # REQUEST_START_LOGGING_MIDDLEWARE
@@ -52,6 +123,25 @@ def health():
         "status": "ok",
         "solver_repo": solver_repo,
         "solver_repo_exists": Path(solver_repo).expanduser().exists(),
+    }
+
+
+@app.post("/metrics")
+async def metrics(payload: dict[str, Any] = Body(...)):
+    """Append AR/mobile prototype metrics to a local CSV.
+
+    This endpoint is intentionally simple:
+    - no database
+    - no authentication
+    - local-development use only
+    - generated CSV stays under assets/metrics/ and is ignored by git
+
+    Curated metrics can later be copied into docs/metrics/ after review.
+    """
+    path = append_ar_trial_metric(payload)
+    return {
+        "status": "ok",
+        "metrics_path": str(path),
     }
 
 
